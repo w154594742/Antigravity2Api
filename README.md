@@ -164,6 +164,21 @@ docker run -d --name antigravity2api \
 - `ghcr.io/znlsl/antigravity2api:latest`
 - 平台：`linux/amd64` + `linux/arm64`（multi-arch）
 
+### 6.4 服务器更新镜像（升级）
+
+如果你使用的是 GHCR 镜像部署（`docker-compose.ghcr.yml`），当仓库有新提交并且 GitHub Actions 构建完成后，在服务器执行：
+
+```bash
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
+```
+
+如果你使用的是本地构建（`docker-compose.yml` 的 `build:`），更新代码后需要重新构建：
+
+```bash
+docker compose up -d --build
+```
+
 ## 7. 客户端连接 (如 CherryStudio)
 
 在客户端中添加自定义提供商（Claude）：
