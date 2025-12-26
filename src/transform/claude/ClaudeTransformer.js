@@ -74,6 +74,16 @@ class StreamingState {
     this.usedTool = false;
     this.signatures = new SignatureManager();  // thinking/FC 签名
     this.trailingSignature = null;  // 空 text 带签名（必须单独用空 thinking 块承载）
+
+    // web_search（grounding）专用：先实时输出 thinking，再在 finish 时补齐 server_tool_use / tool_result / citations / 最终文本
+    this.webSearchMode = false;
+    this.webSearch = {
+      toolUseId: null,
+      query: "",
+      results: [],
+      supports: [],
+      bufferedTextParts: [],
+    };
   }
   
   // 发送 SSE 事件
@@ -146,7 +156,7 @@ class StreamingState {
   }
   
   // 发送结束事件
-  emitFinish(finishReason, usageMetadata) {
+  emitFinish(finishReason, usageMetadata, extraUsage) {
     // 关闭最后一个块
     this.endBlock();
     
@@ -178,11 +188,15 @@ class StreamingState {
     }
     
     const usage = toClaudeUsage(usageMetadata || {});
+    const mergedUsage =
+      extraUsage && typeof extraUsage === "object"
+        ? { ...usage, ...extraUsage }
+        : usage;
     
     this.emit("message_delta", {
       type: "message_delta",
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage
+      usage: mergedUsage
     });
     
     if (!this.messageStopSent) {
@@ -716,7 +730,8 @@ function mapClaudeModelToGemini(claudeModel) {
     "claude-haiku-4": "claude-sonnet-4-5",
     "claude-3-haiku-20240307": "claude-sonnet-4-5",
     "claude-haiku-4-5-20251001": "claude-sonnet-4-5",
-    "gemini-2.5-flash": "gemini-2.5-flash"
+    "gemini-2.5-flash": "gemini-2.5-flash",
+    "gemini-3-flash": "gemini-3-flash"
   };
   return mapping[claudeModel] || "claude-sonnet-4-5";
 }
@@ -1032,6 +1047,25 @@ async function handleNonStreamingResponse(response) {
   let json = await response.json();
   json = json.response || json;
   
+  // v1internal grounding(web search) -> Claude 的 server_tool_use/web_search_tool_result 结构
+  const candidate = json?.candidates?.[0] || null;
+  const groundingMetadata = candidate?.groundingMetadata || null;
+  const hasWebSearchQueries =
+    Array.isArray(groundingMetadata?.webSearchQueries) && typeof groundingMetadata.webSearchQueries[0] === "string";
+  const hasGroundingChunks =
+    Array.isArray(candidate?.groundingChunks) || Array.isArray(groundingMetadata?.groundingChunks);
+  const hasGroundingSupports =
+    Array.isArray(candidate?.groundingSupports) || Array.isArray(groundingMetadata?.groundingSupports);
+  const isWebSearch = hasWebSearchQueries || hasGroundingChunks || hasGroundingSupports;
+
+  if (isWebSearch) {
+    const message = await buildNonStreamingWebSearchMessage(json);
+    return new Response(JSON.stringify(message), {
+      status: response.status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
   const processor = new NonStreamingProcessor(json);
   const result = processor.process();
   
@@ -1039,6 +1073,82 @@ async function handleNonStreamingResponse(response) {
     status: response.status,
     headers: { "Content-Type": "application/json" }
   });
+}
+
+async function buildNonStreamingWebSearchMessage(rawJSON) {
+  const candidate = rawJSON?.candidates?.[0] || {};
+  const parts = candidate?.content?.parts || [];
+  const groundingMetadata = candidate?.groundingMetadata || {};
+
+  const query =
+    Array.isArray(groundingMetadata.webSearchQueries) && typeof groundingMetadata.webSearchQueries[0] === "string"
+      ? groundingMetadata.webSearchQueries[0]
+      : "";
+
+  const groundingChunks = Array.isArray(candidate.groundingChunks)
+    ? candidate.groundingChunks
+    : groundingMetadata.groundingChunks;
+  const results = toWebSearchResults(Array.isArray(groundingChunks) ? groundingChunks : []);
+
+  const groundingSupports = Array.isArray(candidate.groundingSupports)
+    ? candidate.groundingSupports
+    : groundingMetadata.groundingSupports;
+  const supports = Array.isArray(groundingSupports) ? groundingSupports : [];
+
+  // 同 streaming：尽力把 vertex redirect 解析成真实落地 URL
+  await resolveWebSearchRedirectUrls({ results });
+
+  const thinkingText = parts
+    .filter((p) => p?.thought && typeof p.text === "string")
+    .map((p) => p.text)
+    .join("");
+
+  const answerText = parts
+    .filter((p) => !p?.thought && typeof p.text === "string")
+    .map((p) => p.text)
+    .join("");
+
+  const toolUseId = makeSrvToolUseId();
+
+  const content = [];
+  if (thinkingText) content.push({ type: "thinking", thinking: thinkingText });
+
+  content.push({
+    type: "server_tool_use",
+    id: toolUseId,
+    name: "web_search",
+    input: { query },
+  });
+
+  content.push({
+    type: "web_search_tool_result",
+    tool_use_id: toolUseId,
+    content: results,
+  });
+
+  // citations-only blocks（简化版：每个 support 取第一个 groundingChunkIndex）
+  for (const support of supports) {
+    const citation = buildCitationFromSupport(results, support);
+    if (!citation) continue;
+    content.push({ type: "text", text: "", citations: [citation] });
+  }
+
+  if (answerText) content.push({ type: "text", text: answerText });
+
+  const finish = candidate?.finishReason;
+  const stopReason = finish === "MAX_TOKENS" ? "max_tokens" : "end_turn";
+  const usage = toClaudeUsage(rawJSON.usageMetadata || {});
+
+  return {
+    id: rawJSON.responseId || "",
+    type: "message",
+    role: "assistant",
+    model: rawJSON.modelVersion || "",
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: { ...usage, server_tool_use: { web_search_requests: 1 } },
+  };
 }
 
 // 处理流式响应
@@ -1066,13 +1176,13 @@ async function handleStreamingResponse(response) {
           buffer = lines.pop() || "";
           
           for (const line of lines) {
-            processSSELine(line, state, processor);
+            await processSSELine(line, state, processor);
           }
         }
         
         // 处理剩余 buffer
         if (buffer) {
-          processSSELine(buffer, state, processor);
+          await processSSELine(buffer, state, processor);
         }
         
       } catch (error) {
@@ -1094,7 +1204,7 @@ async function handleStreamingResponse(response) {
 }
 
 // 处理单行 SSE 数据
-function processSSELine(line, state, processor) {
+async function processSSELine(line, state, processor) {
   if (!line.startsWith("data: ")) return;
   
   const dataStr = line.slice(6).trim();
@@ -1113,25 +1223,258 @@ function processSSELine(line, state, processor) {
   try {
     let chunk = JSON.parse(dataStr);
     const rawJSON = chunk.response || chunk;
+
+    const candidate = rawJSON.candidates?.[0] || null;
+    const hasGrounding =
+      candidate &&
+      (Object.prototype.hasOwnProperty.call(candidate, "groundingMetadata") ||
+        Object.prototype.hasOwnProperty.call(candidate, "groundingChunks") ||
+        Object.prototype.hasOwnProperty.call(candidate, "groundingSupports"));
     
     // 发送 message_start
     state.emitMessageStart(rawJSON);
+
+    // 进入 web_search 模式（基于 grounding 字段）
+    if (!state.webSearchMode && hasGrounding) {
+      state.webSearchMode = true;
+      state.webSearch.toolUseId = makeSrvToolUseId();
+    }
     
     // 处理所有 parts
-    const parts = rawJSON.candidates?.[0]?.content?.parts || [];
-    for (const part of parts) {
-      processor.process(part);
+    const parts = candidate?.content?.parts || [];
+    if (!state.webSearchMode) {
+      for (const part of parts) processor.process(part);
+    } else {
+      // web_search 模式：thinking 实时输出；非 thinking 文本缓存到最后一个 text block 再输出
+      for (const part of parts) {
+        if (part?.text === undefined) continue;
+        if (part.thought) {
+          processor.process(part);
+        } else {
+          state.webSearch.bufferedTextParts.push(String(part.text));
+        }
+      }
+
+      // 更新 grounding 数据（通常在最后一个 chunk 才完整出现）
+      const webSearchQueries = candidate?.groundingMetadata?.webSearchQueries;
+      if (Array.isArray(webSearchQueries) && typeof webSearchQueries[0] === "string") {
+        state.webSearch.query = webSearchQueries[0];
+      }
+      const groundingChunks = Array.isArray(candidate?.groundingChunks)
+        ? candidate.groundingChunks
+        : candidate?.groundingMetadata?.groundingChunks;
+      if (Array.isArray(groundingChunks)) {
+        state.webSearch.results = toWebSearchResults(groundingChunks);
+      }
+      const groundingSupports = Array.isArray(candidate?.groundingSupports)
+        ? candidate.groundingSupports
+        : candidate?.groundingMetadata?.groundingSupports;
+      if (Array.isArray(groundingSupports)) {
+        state.webSearch.supports = groundingSupports;
+      }
     }
     
     // 检查是否结束
-    const finishReason = rawJSON.candidates?.[0]?.finishReason;
+    const finishReason = candidate?.finishReason;
     if (finishReason) {
-      state.emitFinish(finishReason, rawJSON.usageMetadata);
+      if (!state.webSearchMode) {
+        state.emitFinish(finishReason, rawJSON.usageMetadata);
+        return;
+      }
+
+      // web_search：在 message_delta 前补齐 server_tool_use / tool_result / citations / 最终文本
+      await resolveWebSearchRedirectUrls(state.webSearch);
+      emitWebSearchBlocks(state);
+      state.emitFinish(finishReason, rawJSON.usageMetadata, {
+        server_tool_use: { web_search_requests: 1 },
+      });
     }
     
   } catch (e) {
     // 解析失败，忽略
   }
+}
+
+function makeSrvToolUseId() {
+  return `srvtoolu_${Math.random().toString(36).slice(2, 26)}`;
+}
+
+function stableEncryptedContent(payload) {
+  try {
+    const json = JSON.stringify(payload);
+    return Buffer.from(json, "utf8").toString("base64");
+  } catch {
+    return "";
+  }
+}
+
+function toWebSearchResults(groundingChunks = []) {
+  return (groundingChunks || [])
+    .map((chunk) => {
+      const web = chunk?.web || {};
+      const url = typeof web.uri === "string" ? web.uri : "";
+      const title = typeof web.title === "string" ? web.title : (typeof web.domain === "string" ? web.domain : "");
+      return {
+        type: "web_search_result",
+        title,
+        url,
+        encrypted_content: stableEncryptedContent({ url, title }),
+        page_age: null,
+      };
+    })
+    .filter((r) => r.url || r.title);
+}
+
+const resolvedRedirectUrlCache = new Map(); // vertex redirect url -> final url
+
+function isVertexGroundingRedirectUrl(url) {
+  return (
+    typeof url === "string" &&
+    url.startsWith("https://vertexaisearch.cloud.google.com/grounding-api-redirect/")
+  );
+}
+
+async function fetchFinalUrl(url, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { method: "HEAD", redirect: "follow", signal: controller.signal });
+    // node-fetch/undici: final URL is exposed as res.url
+    if (res && typeof res.url === "string" && res.url) return res.url;
+    return url;
+  } catch (e) {
+    // Some hosts don't support HEAD; fallback to GET
+    try {
+      const res = await fetch(url, { method: "GET", redirect: "follow", signal: controller.signal });
+      const finalUrl = res && typeof res.url === "string" && res.url ? res.url : url;
+      try {
+        if (res?.body?.cancel) await res.body.cancel();
+      } catch {}
+      try {
+        if (res?.body?.destroy) res.body.destroy();
+      } catch {}
+      return finalUrl;
+    } catch {
+      return url;
+    }
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function resolveVertexGroundingRedirectUrl(url) {
+  if (!isVertexGroundingRedirectUrl(url)) return url;
+  const cached = resolvedRedirectUrlCache.get(url);
+  if (typeof cached === "string") return cached;
+  if (cached && typeof cached.then === "function") return cached;
+
+  const promise = (async () => {
+    const finalUrl = await fetchFinalUrl(url, 1500);
+    return finalUrl;
+  })();
+
+  resolvedRedirectUrlCache.set(url, promise);
+  try {
+    const finalUrl = await promise;
+    resolvedRedirectUrlCache.set(url, finalUrl);
+    if (resolvedRedirectUrlCache.size > 2000) resolvedRedirectUrlCache.clear();
+    return finalUrl;
+  } catch {
+    resolvedRedirectUrlCache.delete(url);
+    return url;
+  }
+}
+
+async function resolveWebSearchRedirectUrls(webSearch) {
+  const results = Array.isArray(webSearch?.results) ? webSearch.results : [];
+  if (results.length === 0) return;
+
+  // Best-effort resolve (proxy-aware: global fetch is already patched in src/utils/proxy.js)
+  await Promise.all(
+    results.slice(0, 10).map(async (result) => {
+      if (!result || typeof result.url !== "string" || !result.url) return;
+      const finalUrl = await resolveVertexGroundingRedirectUrl(result.url);
+      if (finalUrl && finalUrl !== result.url) {
+        result.url = finalUrl;
+        result.encrypted_content = stableEncryptedContent({ url: result.url, title: result.title });
+      }
+    })
+  );
+}
+
+function buildCitationFromSupport(results, support) {
+  const cited_text = support?.segment?.text;
+  if (typeof cited_text !== "string" || cited_text.length === 0) return null;
+
+  const idx = Array.isArray(support?.groundingChunkIndices) ? support.groundingChunkIndices[0] : null;
+  if (typeof idx !== "number") return null;
+
+  const result = results[idx];
+  if (!result) return null;
+
+  return {
+    type: "web_search_result_location",
+    cited_text,
+    url: result.url,
+    title: result.title,
+    encrypted_index: stableEncryptedContent({ url: result.url, title: result.title, cited_text }),
+  };
+}
+
+function emitWebSearchBlocks(state) {
+  // 确保 index:0 是 thinking（即使为空）
+  if (state.blockIndex === 0 && state.blockType === StreamingState.BLOCK_NONE) {
+    state.startBlock(StreamingState.BLOCK_THINKING, { type: "thinking", thinking: "" });
+    state.emitDelta("thinking_delta", { thinking: "" });
+    state.endBlock();
+  } else if (state.blockType === StreamingState.BLOCK_THINKING) {
+    // 结束 thinking 前补一个空 delta（更贴近官方流式形态）
+    state.emitDelta("thinking_delta", { thinking: "" });
+    state.endBlock();
+  } else {
+    state.endBlock();
+  }
+
+  const toolUseId = state.webSearch.toolUseId || makeSrvToolUseId();
+  state.webSearch.toolUseId = toolUseId;
+
+  // index:1 server_tool_use
+  state.startBlock(StreamingState.BLOCK_TEXT, {
+    type: "server_tool_use",
+    id: toolUseId,
+    name: "web_search",
+    input: {},
+  });
+  const query = typeof state.webSearch.query === "string" ? state.webSearch.query : "";
+  state.emitDelta("input_json_delta", { partial_json: JSON.stringify({ query }) });
+  state.endBlock();
+
+  // index:2 web_search_tool_result
+  state.startBlock(StreamingState.BLOCK_TEXT, {
+    type: "web_search_tool_result",
+    tool_use_id: toolUseId,
+    content: Array.isArray(state.webSearch.results) ? state.webSearch.results : [],
+  });
+  state.endBlock();
+
+  // index:3.. citations-only blocks
+  const results = Array.isArray(state.webSearch.results) ? state.webSearch.results : [];
+  const supports = Array.isArray(state.webSearch.supports) ? state.webSearch.supports : [];
+  for (const support of supports) {
+    const citation = buildCitationFromSupport(results, support);
+    if (!citation) continue;
+    state.startBlock(StreamingState.BLOCK_TEXT, { citations: [], type: "text", text: "" });
+    state.emitDelta("citations_delta", { citation });
+    state.endBlock();
+  }
+
+  // final index：输出非思考 text（原始 chunk 一行一行）
+  state.startBlock(StreamingState.BLOCK_TEXT, { type: "text", text: "" });
+  for (const text of state.webSearch.bufferedTextParts) {
+    if (!text) continue;
+    state.emitDelta("text_delta", { text });
+  }
+  state.endBlock();
 }
 
 // ==================== 导出 ====================
