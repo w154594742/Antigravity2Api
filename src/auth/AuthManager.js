@@ -108,11 +108,12 @@ class AuthManager {
   log(title, data) {
     if (this.logger) {
       // 支持新的日志 API
+      if (typeof this.logger === "function") {
+        return this.logger(title, data);
+      }
       if (typeof this.logger.log === "function") {
         return this.logger.log(title, data);
       }
-      // 兼容旧的日志函数
-      return this.logger(title, data);
     }
     if (data !== undefined && data !== null) {
       console.log(`[${title}]`, typeof data === "string" ? data : JSON.stringify(data, null, 2));
