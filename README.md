@@ -81,6 +81,7 @@ AG2API_PROXY_ENABLED=false
 AG2API_PROXY_URL=
 AG2API_DEBUG=false
 AG2API_LOG_RETENTION_DAYS=3
+AG2API_RETRY_DELAY_MS=1200
 AG2API_SWITCH_TO_MCP_MODEL=gemini-3-flash
 AG2API_UPDATE_REPO=znlsl/Antigravity2Api
 ```
@@ -94,6 +95,7 @@ AG2API_UPDATE_REPO=znlsl/Antigravity2Api
 - `AG2API_PROXY_URL`：代理地址
 - `AG2API_DEBUG`：是否开启 debug（true/false）
 - `AG2API_LOG_RETENTION_DAYS`：日志保留天数（默认 3；设为 0 表示不自动清理）
+- `AG2API_RETRY_DELAY_MS`：网络错误 / 429 重试前的固定等待（毫秒，默认 1200）
 - `AG2API_SWITCH_TO_MCP_MODEL`：MCP 折中方案开关；为空/不配置表示关闭，配置为 `gemini-*`（如 `gemini-3-flash`）表示在检测到 `AG2API_SWITCH_TO_MCP_MODEL` 信号或 `mcp__*` 工具调用时自动切换并重试
 - `AG2API_UPDATE_REPO`：管理界面版本检查的 GitHub 仓库（默认 `znlsl/Antigravity2Api`，用于获取 latest release）
 
