@@ -50,6 +50,8 @@ function cleanSchema(schema) {
     "uniqueItems",
     // v1internal Schema doesn't support JSON Schema draft keywords like `propertyNames`.
     "propertyNames",
+    "patternProperties",
+    "unevaluatedProperties"
   ]);
   let constValue;
   const validations = [];
