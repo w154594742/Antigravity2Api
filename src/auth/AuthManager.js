@@ -96,6 +96,8 @@ class AuthManager {
       logger: this.logger,
       refreshFn: this.refreshToken.bind(this),
     });
+
+    this.initialTokenRefreshPromise = null;
   }
 
   setLogger(logger) {
@@ -262,8 +264,19 @@ class AuthManager {
       for (const account of this.accounts) {
         this.tokenRefresher.scheduleRefresh(account);
       }
+
+      // Kick off an initial refresh batch (non-blocking) so downstream quota refresh can run with valid tokens.
+      this.initialTokenRefreshPromise = this.tokenRefresher
+        ? this.tokenRefresher.refreshDueAccountsNow().catch(() => {})
+        : Promise.resolve();
     } catch (err) {
       this.log("error", `Error loading accounts: ${err.message || err}`);
+    }
+  }
+
+  async waitInitialTokenRefresh() {
+    if (this.initialTokenRefreshPromise) {
+      await this.initialTokenRefreshPromise;
     }
   }
 
@@ -284,7 +297,6 @@ class AuthManager {
   }
 
   async fetchProjectId(accessToken) {
-    await this.waitForApiSlot();
     const { projectId, rawBody } = await httpClient.fetchProjectId(accessToken, this.apiLimiter);
     this.lastLoadCodeAssistBody = rawBody;
     return projectId;
@@ -357,6 +369,69 @@ class AuthManager {
       accessToken: account.creds.access_token,
       projectId: account.creds.projectId,
       account,
+    };
+  }
+
+  async getCredentialsByIndex(index, group) {
+    if (this.accounts.length === 0) {
+      throw new Error("No accounts available. Please authenticate first.");
+    }
+
+    const quotaGroup = normalizeQuotaGroup(group);
+    const accountIndex = Number.isInteger(index) ? index : Number.parseInt(String(index), 10);
+    if (!Number.isInteger(accountIndex) || accountIndex < 0 || accountIndex >= this.accounts.length) {
+      throw new Error(`Invalid account index: ${index}`);
+    }
+
+    const account = this.accounts[accountIndex];
+
+    if (account.refreshPromise) {
+      await account.refreshPromise;
+    }
+
+    if (account.creds.expiry_date < +new Date()) {
+      const accountName = path.basename(account.filePath);
+      this.log("info", `Refreshing token for [${quotaGroup}] account ${accountIndex + 1} (${accountName})...`);
+      await this.refreshToken(account);
+    }
+
+    await this.ensureProjectId(account);
+
+    return {
+      accessToken: account.creds.access_token,
+      projectId: account.creds.projectId,
+      account,
+      accountIndex,
+    };
+  }
+
+  async getAccessTokenByIndex(index, group) {
+    if (this.accounts.length === 0) {
+      throw new Error("No accounts available. Please authenticate first.");
+    }
+
+    const quotaGroup = normalizeQuotaGroup(group);
+    const accountIndex = Number.isInteger(index) ? index : Number.parseInt(String(index), 10);
+    if (!Number.isInteger(accountIndex) || accountIndex < 0 || accountIndex >= this.accounts.length) {
+      throw new Error(`Invalid account index: ${index}`);
+    }
+
+    const account = this.accounts[accountIndex];
+
+    if (account.refreshPromise) {
+      await account.refreshPromise;
+    }
+
+    if (account.creds.expiry_date < +new Date()) {
+      const accountName = path.basename(account.filePath);
+      this.log("info", `Refreshing token for [${quotaGroup}] account ${accountIndex + 1} (${accountName})...`);
+      await this.refreshToken(account);
+    }
+
+    return {
+      accessToken: account.creds.access_token,
+      account,
+      accountIndex,
     };
   }
 
@@ -510,8 +585,7 @@ class AuthManager {
     account.refreshPromise = (async () => {
       try {
         const refresh_token = account.creds.refresh_token;
-        await this.waitForApiSlot();
-        const data = await httpClient.refreshToken(refresh_token, this.apiLimiter);
+        const data = await httpClient.refreshToken(refresh_token, null);
 
         // 保持 email 字段 (如果有)
         if (account.creds.email) {
@@ -543,7 +617,6 @@ class AuthManager {
 
         account.creds = data;
         await fs.writeFile(account.filePath, JSON.stringify(data, null, 2));
-        this.log("info", `✅ Token refreshed for ${path.basename(account.filePath)}`);
 
         this.tokenRefresher.scheduleRefresh(account);
 

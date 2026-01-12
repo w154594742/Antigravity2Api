@@ -16,6 +16,14 @@ function parseEnvNonNegativeInt(name, fallback) {
 // - 429 with retryDelay > 5000ms (after rotation)
 const FIXED_RETRY_DELAY_MS = parseEnvNonNegativeInt("AG2API_RETRY_DELAY_MS", 1200);
 
+// Quota refresh interval (seconds). Each tick refreshes ALL accounts concurrently.
+// Default: 300s.
+const QUOTA_REFRESH_S = parseEnvNonNegativeInt("AG2API_QUOTA_REFRESH_S", 300);
+const QUOTA_REFRESH_MS = QUOTA_REFRESH_S * 1000;
+
+// First request will wait up to this long for the initial quota refresh to complete.
+const INITIAL_QUOTA_WAIT_MS = 3000;
+
 const KNOWN_LOG_LEVELS = new Set([
   "debug",
   "info",
@@ -40,6 +48,18 @@ class UpstreamClient {
   constructor(authManager, options = {}) {
     this.auth = authManager;
     this.logger = options.logger || null;
+
+    // Per-model quota cache:
+    // model -> (accountKey -> { remainingPercent, resetTimeMs, cooldownUntilMs, updatedAtMs, ... })
+    this.modelQuotaByAccount = new Map();
+    // Cache last HTTP error response per model (for fast-fail when all accounts are exhausted).
+    this.lastErrorByModel = new Map();
+
+    this._quotaRefreshInFlight = false;
+    this._quotaRefreshTimer = null;
+    this._initialQuotaRefreshPromise = null;
+    this._initialQuotaRefreshDone = false;
+    this.startQuotaRefresher();
   }
 
   // 基础日志方法（兼容旧 API）
@@ -163,6 +183,153 @@ class UpstreamClient {
     return null;
   }
 
+  getAccountKeyFromAccount(account) {
+    return account?.filePath ? path.basename(account.filePath) : "unknown-account";
+  }
+
+  startQuotaRefresher() {
+    if (this._quotaRefreshTimer || this._initialQuotaRefreshPromise) return;
+
+    // Initial refresh: wait for accounts to load (up to INITIAL_QUOTA_WAIT_MS),
+    // then refresh all accounts concurrently.
+    this._initialQuotaRefreshPromise = (async () => {
+      try {
+        const ready = await this.waitForAccountsReady(INITIAL_QUOTA_WAIT_MS);
+        if (!ready) return;
+        if (this.auth && typeof this.auth.waitInitialTokenRefresh === "function") {
+          await this.auth.waitInitialTokenRefresh();
+        }
+        await this.refreshAllAccountQuotas();
+      } catch (e) {
+        this.logError("额度刷新失败", e);
+      }
+    })().finally(() => {
+      this._initialQuotaRefreshDone = true;
+    });
+
+    if (!Number.isFinite(QUOTA_REFRESH_MS) || QUOTA_REFRESH_MS <= 0) return;
+
+    const tick = async () => {
+      try {
+        await this.refreshAllAccountQuotas();
+      } catch (e) {
+        this.logError("额度刷新失败", e);
+      }
+    };
+
+    this._quotaRefreshTimer = setInterval(() => tick(), QUOTA_REFRESH_MS);
+    if (this._quotaRefreshTimer && typeof this._quotaRefreshTimer.unref === "function") this._quotaRefreshTimer.unref();
+  }
+
+  async waitForAccountsReady(timeoutMs) {
+    const timeout = Number.isFinite(timeoutMs) ? timeoutMs : 0;
+    if (timeout <= 0) {
+      const count = this.auth && typeof this.auth.getAccountCount === "function" ? this.auth.getAccountCount() : 0;
+      return count > 0;
+    }
+
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const count = this.auth && typeof this.auth.getAccountCount === "function" ? this.auth.getAccountCount() : 0;
+      if (count > 0) return true;
+      await this.sleep(50);
+    }
+
+    const count = this.auth && typeof this.auth.getAccountCount === "function" ? this.auth.getAccountCount() : 0;
+    return count > 0;
+  }
+
+  async refreshAllAccountQuotas() {
+    if (this._quotaRefreshInFlight) return;
+    if (!this.auth || typeof this.auth.getAccountCount !== "function") return;
+
+    const accountCount = this.auth.getAccountCount();
+    if (!accountCount) return;
+
+    this._quotaRefreshInFlight = true;
+
+    try {
+      const now = Date.now();
+      const perAccount = [];
+
+      for (let accountIndex = 0; accountIndex < accountCount; accountIndex++) {
+        perAccount.push(
+          (async () => {
+            let account = null;
+            let accessToken = null;
+
+            try {
+              if (typeof this.auth.getAccessTokenByIndex === "function") {
+                const creds = await this.auth.getAccessTokenByIndex(accountIndex, "gemini");
+                account = creds.account;
+                accessToken = creds.accessToken;
+              } else if (Array.isArray(this.auth.accounts)) {
+                account = this.auth.accounts[accountIndex];
+                accessToken = account?.creds?.access_token || null;
+              }
+            } catch (e) {
+              const accountKey = this.getAccountKeyFromAccount(account) || `account_${accountIndex}`;
+              return { accountKey, ok: false, error: e };
+            }
+
+            const accountKey = this.getAccountKeyFromAccount(account);
+            if (!accessToken) {
+              return { accountKey, ok: false, error: new Error("Missing access_token") };
+            }
+            try {
+              const models = await httpClient.fetchAvailableModels(accessToken, null);
+              return { accountKey, ok: true, models };
+            } catch (e) {
+              return { accountKey, ok: false, error: e };
+            }
+          })(),
+        );
+      }
+
+      const results = await Promise.all(perAccount);
+
+      const failed = results.filter((r) => !r || !r.ok);
+      for (const item of failed) {
+        const accountKey = item?.accountKey || "unknown-account";
+        const message = String(item?.error?.message || item?.error || "unknown error")
+          .split("\n")[0]
+          .slice(0, 200);
+        this.log("quota", `额度刷新失败 @${accountKey}${message ? ` (${message})` : ""}`);
+      }
+
+      this.log("quota", `额度刷新完成 ok=${results.length - failed.length} fail=${failed.length}`);
+
+      for (const item of results) {
+        if (!item || !item.ok || !item.models || typeof item.models !== "object") continue;
+        const { accountKey, models } = item;
+
+        for (const modelId of Object.keys(models)) {
+          const quotaInfo = models[modelId]?.quotaInfo || {};
+          const remainingFraction = quotaInfo.remainingFraction;
+          const remainingPercent =
+            remainingFraction !== undefined && remainingFraction !== null ? Math.round(remainingFraction * 100) : null;
+          const resetTime = quotaInfo.resetTime || null;
+          const resetTimeMs = resetTime ? Date.parse(resetTime) : null;
+
+          const perModel = this.modelQuotaByAccount.get(modelId) || new Map();
+          const prev = perModel.get(accountKey) || {};
+          perModel.set(accountKey, {
+            ...prev,
+            remainingFraction,
+            remainingPercent,
+            resetTime,
+            resetTimeMs: Number.isFinite(resetTimeMs) ? resetTimeMs : null,
+            updatedAtMs: now,
+          });
+          this.modelQuotaByAccount.set(modelId, perModel);
+        }
+      }
+
+    } finally {
+      this._quotaRefreshInFlight = false;
+    }
+  }
+
   parseErrorDetails(errText) {
     try {
       const errObj = JSON.parse(errText);
@@ -178,7 +345,125 @@ class UpstreamClient {
   }
 
   sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      if (timer && typeof timer.unref === "function") timer.unref();
+    });
+  }
+
+  setCooldownUntil(modelId, accountKey, cooldownUntilMs) {
+    const key = String(modelId || "").trim();
+    if (!key) return;
+    const perModel = this.modelQuotaByAccount.get(key) || new Map();
+    const prev = perModel.get(accountKey) || {};
+    perModel.set(accountKey, {
+      ...prev,
+      cooldownUntilMs: Number.isFinite(cooldownUntilMs) ? cooldownUntilMs : null,
+    });
+    this.modelQuotaByAccount.set(key, perModel);
+  }
+
+  async cacheLastErrorResponse(modelId, response) {
+    const key = String(modelId || "").trim();
+    if (!key || !response) return;
+
+    let bodyText = "";
+    try {
+      bodyText = await response.clone().text();
+    } catch (_) {}
+
+    const headers = {};
+    try {
+      response.headers?.forEach?.((value, name) => {
+        headers[name] = value;
+      });
+    } catch (_) {}
+
+    this.lastErrorByModel.set(key, {
+      status: response.status,
+      headers,
+      bodyText,
+      cachedAtMs: Date.now(),
+    });
+  }
+
+  getCachedErrorResponse(modelId) {
+    const key = String(modelId || "").trim();
+    if (!key) return null;
+    const cached = this.lastErrorByModel.get(key);
+    if (!cached) return null;
+    try {
+      return new Response(cached.bodyText || "", {
+        status: cached.status || 500,
+        headers: cached.headers || {},
+      });
+    } catch (_) {
+      return null;
+    }
+  }
+
+  getAccountPrioritiesForModel(modelId, options = {}) {
+    const now = Number.isFinite(options.now) ? options.now : Date.now();
+    const includeZero = !!options.includeZero;
+    const excludeAccountIndices = options.excludeAccountIndices instanceof Set ? options.excludeAccountIndices : new Set();
+
+    const accounts = Array.isArray(this.auth?.accounts) ? this.auth.accounts : [];
+    const perModel = this.modelQuotaByAccount.get(String(modelId || "").trim());
+
+    let knownCount = 0;
+    let nonZeroKnownCount = 0;
+    const items = [];
+
+    for (let accountIndex = 0; accountIndex < accounts.length; accountIndex++) {
+      if (excludeAccountIndices.has(accountIndex)) continue;
+
+      const account = accounts[accountIndex];
+      const accountKey = this.getAccountKeyFromAccount(account);
+      const q = perModel ? perModel.get(accountKey) : null;
+
+      const remainingPercent = Number.isFinite(q?.remainingPercent) ? q.remainingPercent : null;
+      if (remainingPercent !== null) {
+        knownCount++;
+        if (remainingPercent > 0) nonZeroKnownCount++;
+      }
+
+      if (!includeZero && remainingPercent === 0) continue;
+
+      const resetTimeMs = Number.isFinite(q?.resetTimeMs) ? q.resetTimeMs : null;
+      const cooldownUntilMs = Number.isFinite(q?.cooldownUntilMs) ? q.cooldownUntilMs : 0;
+
+      items.push({
+        accountIndex,
+        accountKey,
+        remainingPercent,
+        resetTimeMs,
+        cooldownUntilMs,
+        cooldownActive: cooldownUntilMs > now,
+      });
+    }
+
+    items.sort((a, b) => {
+      if (a.cooldownActive !== b.cooldownActive) return a.cooldownActive ? 1 : -1;
+
+      const aPct = a.remainingPercent !== null ? a.remainingPercent : -1;
+      const bPct = b.remainingPercent !== null ? b.remainingPercent : -1;
+      if (aPct !== bPct) return bPct - aPct;
+
+      const aReset = Number.isFinite(a.resetTimeMs) ? a.resetTimeMs : Number.POSITIVE_INFINITY;
+      const bReset = Number.isFinite(b.resetTimeMs) ? b.resetTimeMs : Number.POSITIVE_INFINITY;
+      if (aReset !== bReset) return aReset - bReset;
+
+      return a.accountIndex - b.accountIndex;
+    });
+
+    const allKnown = accounts.length > 0 && knownCount === accounts.length;
+    const allZeroKnown = allKnown && nonZeroKnownCount === 0;
+
+    return {
+      items,
+      allKnown,
+      allZeroKnown,
+    };
   }
 
   /**
@@ -199,31 +484,134 @@ class UpstreamClient {
     }
 
     const quotaGroup = this.getQuotaGroupFromModel(options.group || options.model);
+    const modelId = String(options.model || "").trim();
     const queryString = options.queryString || "";
     const headers = options.headers && typeof options.headers === "object" ? options.headers : {};
 
     let lastResponse = null;
+    let lastNetworkError = null;
     const maxAttempts = this.getMaxAttempts();
 
     this.logUpstream(`开始调用 v1internal:${method}`, {
       method,
       group: quotaGroup,
-      model: options.model,
+      model: modelId || options.model,
       maxAttempts,
     });
 
+    // Best-effort: wait for initial quota refresh so the first request can pick the best account.
+    if (modelId && this._initialQuotaRefreshPromise && !this._initialQuotaRefreshDone) {
+      try {
+        await Promise.race([this._initialQuotaRefreshPromise, this.sleep(INITIAL_QUOTA_WAIT_MS)]);
+      } catch (_) {}
+    }
+
+    // Fast-fail: if we KNOW all accounts have 0% quota for this model, do not try all accounts.
+    if (modelId) {
+      const snapshot = this.getAccountPrioritiesForModel(modelId, { includeZero: true, now: Date.now() });
+      if (snapshot.allZeroKnown) {
+        const cached = this.getCachedErrorResponse(modelId);
+        if (cached) return cached;
+
+        const pick = snapshot.items[0];
+        if (!pick) {
+          throw new Error(`No accounts available for model ${modelId}`);
+        }
+
+        let creds;
+        try {
+          creds = await this.auth.getCredentialsByIndex(pick.accountIndex, quotaGroup);
+        } catch (e) {
+          this.logError(`获取凭证失败 [${quotaGroup}]`, e, { attempt: 1, maxAttempts: 1 });
+          throw e;
+        }
+
+        const accountName = this.getAccountKeyFromAccount(creds.account);
+        const requestBody = buildBody(creds.projectId);
+        const startTime = Date.now();
+
+        this.logUpstream(`发送请求`, {
+          method,
+          account: accountName,
+          group: quotaGroup,
+          attempt: 1,
+          maxAttempts: 1,
+          model: modelId,
+        });
+
+        let response;
+        try {
+          response = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
+            queryString,
+            headers,
+            limiter: this.auth.apiLimiter,
+          });
+        } catch (netErr) {
+          const duration = Date.now() - startTime;
+          this.logError(`网络错误`, netErr, {
+            context: {
+              method: `v1internal:${method}`,
+              group: quotaGroup,
+              account: accountName,
+              attempt: 1,
+              maxAttempts: 1,
+              duration,
+            },
+          });
+          throw netErr;
+        }
+
+        if (!response.ok) {
+          await this.cacheLastErrorResponse(modelId, response);
+        }
+
+        return response;
+      }
+    }
+
+    const triedAccountIndices = new Set();
+
     for (let attempts = 0; attempts < maxAttempts; attempts++) {
       const attemptNum = attempts + 1;
+      const now = Date.now();
+
+      let picked = null;
+      if (modelId) {
+        const { items } = this.getAccountPrioritiesForModel(modelId, { now, excludeAccountIndices: triedAccountIndices });
+        if (items.length === 0) break;
+
+        if (items.every((item) => item.cooldownActive)) {
+          const cached = this.getCachedErrorResponse(modelId);
+          if (cached) return cached;
+          if (lastResponse) return lastResponse;
+          if (lastNetworkError) throw lastNetworkError;
+          throw new Error(`All accounts are in cooldown for model ${modelId}`);
+        }
+
+        picked = items[0];
+      } else {
+        // If model is unknown, fall back to current account selection by group index.
+        picked = {
+          accountIndex: this.auth?.getCurrentAccountIndex ? this.auth.getCurrentAccountIndex(quotaGroup) : 0,
+          accountKey: "unknown-account",
+          remainingPercent: null,
+          resetTimeMs: null,
+          cooldownUntilMs: 0,
+          cooldownActive: false,
+        };
+      }
+
+      triedAccountIndices.add(picked.accountIndex);
+
       let creds;
-      
       try {
-        creds = await this.auth.getCredentials(quotaGroup);
+        creds = await this.auth.getCredentialsByIndex(picked.accountIndex, quotaGroup);
       } catch (e) {
         this.logError(`获取凭证失败 [${quotaGroup}]`, e, { attempt: attemptNum, maxAttempts });
         throw e;
       }
 
-      const accountName = creds?.account?.filePath ? path.basename(creds.account.filePath) : "unknown-account";
+      const accountName = this.getAccountKeyFromAccount(creds.account);
       const requestBody = buildBody(creds.projectId);
       let startTime = Date.now();
 
@@ -233,7 +621,7 @@ class UpstreamClient {
         group: quotaGroup,
         attempt: attemptNum,
         maxAttempts,
-        model: options.model,
+        model: modelId || options.model,
       });
 
       let response;
@@ -245,6 +633,8 @@ class UpstreamClient {
         });
       } catch (netErr) {
         const duration = Date.now() - startTime;
+        lastNetworkError = netErr;
+
         this.logError(`网络错误`, netErr, {
           context: {
             method: `v1internal:${method}`,
@@ -256,57 +646,51 @@ class UpstreamClient {
           },
         });
 
-        // Network/transport error: wait a bit then retry once on the same account.
-        this.logRetry("网络错误，等待重试", {
-          attempt: attemptNum,
-          maxAttempts,
-          delayMs: FIXED_RETRY_DELAY_MS,
-          account: accountName,
-          error: netErr.message || netErr,
-          nextAction: "同账户重试",
-        });
-
-        await this.sleep(FIXED_RETRY_DELAY_MS);
-
-        // Retry once on the same account with the same request body.
-        startTime = Date.now();
-        try {
-          response = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
-            queryString,
-            headers,
-            limiter: this.auth.apiLimiter,
-          });
-        } catch (netErr2) {
-          const retryDuration = Date.now() - startTime;
-          this.logError(`重试时网络错误`, netErr2, {
-            context: {
-              method: `v1internal:${method}`,
-              group: quotaGroup,
-              account: accountName,
-              attempt: attemptNum,
-              maxAttempts,
-              duration: retryDuration,
-            },
-          });
-
-          // Retry still failed: rotate and try next account.
-          lastResponse = null;
-
-          this.logRetry("网络错误，轮换账户", {
+        if (maxAttempts === 1) {
+          this.logRetry("网络错误，等待重试", {
             attempt: attemptNum,
             maxAttempts,
             delayMs: FIXED_RETRY_DELAY_MS,
             account: accountName,
-            error: netErr2.message || netErr2,
+            error: netErr.message || netErr,
+            nextAction: "同账户重试",
+          });
+
+          await this.sleep(FIXED_RETRY_DELAY_MS);
+
+          startTime = Date.now();
+          try {
+            response = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
+              queryString,
+              headers,
+              limiter: this.auth.apiLimiter,
+            });
+          } catch (netErr2) {
+            const retryDuration = Date.now() - startTime;
+            lastNetworkError = netErr2;
+            this.logError(`重试时网络错误`, netErr2, {
+              context: {
+                method: `v1internal:${method}`,
+                group: quotaGroup,
+                account: accountName,
+                attempt: attemptNum,
+                maxAttempts,
+                duration: retryDuration,
+              },
+            });
+            throw netErr2;
+          }
+        } else {
+          this.logRetry("网络错误，切换账户重试", {
+            attempt: attemptNum,
+            maxAttempts,
+            delayMs: FIXED_RETRY_DELAY_MS,
+            account: accountName,
+            error: netErr.message || netErr,
             nextAction: "轮换到下一个账户",
           });
 
-          if (this.auth && typeof this.auth.rotateAccount === "function") {
-            this.auth.rotateAccount(quotaGroup);
-          }
-          if (attemptNum < maxAttempts) {
-            await this.sleep(FIXED_RETRY_DELAY_MS);
-          }
+          await this.sleep(FIXED_RETRY_DELAY_MS);
           continue;
         }
       }
@@ -346,10 +730,16 @@ class UpstreamClient {
           error: errorDetails,
         });
 
+        if (modelId) {
+          await this.cacheLastErrorResponse(modelId, response);
+        }
         return response;
       }
 
       lastResponse = response;
+      if (modelId) {
+        await this.cacheLastErrorResponse(modelId, response);
+      }
 
       // 429: decide short-wait retry vs rotate.
       let errorText = "";
@@ -368,310 +758,131 @@ class UpstreamClient {
 
       this.log("error", `🚫 Google API 429 错误详情`, errorDetails);
 
+      if (modelId) {
+        const cooldownUntil = now + (retryMs != null ? Math.max(0, retryMs) : FIXED_RETRY_DELAY_MS);
+        this.setCooldownUntil(modelId, accountName, cooldownUntil);
+      }
+
+      if (maxAttempts === 1) {
+        if (retryMs != null && retryMs > 5000) {
+          // Long cooldown: do not wait, just return the 429 as-is.
+          return response;
+        }
+
+        const delay = retryMs == null ? FIXED_RETRY_DELAY_MS : Math.max(0, retryMs + 200);
+        const reason = retryMs == null ? "429 无重试信息，延迟后同账户重试" : "短时间限流，延迟后同账户重试";
+        this.logRetry(reason, {
+          attempt: attemptNum,
+          maxAttempts,
+          delayMs: delay,
+          account: accountName,
+          nextAction: "同账户重试",
+        });
+
+        await this.sleep(delay);
+
+        startTime = Date.now();
+        let retryResp;
+        try {
+          retryResp = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
+            queryString,
+            headers,
+            limiter: this.auth.apiLimiter,
+          });
+        } catch (netErr2) {
+          const retryDuration = Date.now() - startTime;
+          lastNetworkError = netErr2;
+          this.logError(`重试时网络错误`, netErr2, {
+            context: {
+              method: `v1internal:${method}`,
+              group: quotaGroup,
+              account: accountName,
+              attempt: attemptNum,
+              maxAttempts,
+              duration: retryDuration,
+            },
+          });
+          throw netErr2;
+        }
+
+        const retryDuration = Date.now() - startTime;
+        if (retryResp.ok) {
+          this.logUpstream(`重试成功`, {
+            method,
+            account: accountName,
+            group: quotaGroup,
+            attempt: attemptNum,
+            maxAttempts,
+            status: retryResp.status,
+            duration: retryDuration,
+          });
+          return retryResp;
+        }
+
+        if (modelId) {
+          await this.cacheLastErrorResponse(modelId, retryResp);
+        }
+
+        if (retryResp.status !== 429) {
+          this.logUpstream(`重试返回非 429 错误`, {
+            method,
+            account: accountName,
+            group: quotaGroup,
+            attempt: attemptNum,
+            maxAttempts,
+            status: retryResp.status,
+            duration: retryDuration,
+          });
+          return retryResp;
+        }
+
+        lastResponse = retryResp;
+        return retryResp;
+      }
+
       if (retryMs == null) {
-        const delay = FIXED_RETRY_DELAY_MS;
-
-        this.logRetry("429 无重试信息，等待重试", {
+        this.logRetry("429 无重试信息，延迟后切换账户", {
           attempt: attemptNum,
           maxAttempts,
-          delayMs: delay,
+          delayMs: FIXED_RETRY_DELAY_MS,
           account: accountName,
-          nextAction: "同账户重试",
+          nextAction: "延迟后轮换到下一个账户",
         });
-
-        await this.sleep(delay);
-
-        // Retry once on the same account with the same request body.
-        const retryStartTime = Date.now();
-        let retryResp;
-        try {
-          retryResp = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
-            queryString,
-            headers,
-            limiter: this.auth.apiLimiter,
-          });
-        } catch (netErr2) {
-          const retryDuration = Date.now() - retryStartTime;
-          this.logError(`重试时网络错误`, netErr2, {
-            context: {
-              method: `v1internal:${method}`,
-              group: quotaGroup,
-              account: accountName,
-              attempt: attemptNum,
-              duration: retryDuration,
-            },
-          });
-
-          this.logRetry("重试失败，轮换账户", {
-            attempt: attemptNum,
-            maxAttempts,
-            delayMs: FIXED_RETRY_DELAY_MS,
-            account: accountName,
-            error: netErr2.message || netErr2,
-            nextAction: "轮换到下一个账户",
-          });
-
-          if (this.auth && typeof this.auth.rotateAccount === "function") {
-            this.auth.rotateAccount(quotaGroup);
-          }
-          if (attemptNum < maxAttempts) {
-            await this.sleep(FIXED_RETRY_DELAY_MS);
-          }
-          continue;
-        }
-
-        const retryDuration = Date.now() - retryStartTime;
-
-        if (retryResp.ok) {
-          this.logUpstream(`重试成功`, {
-            method,
-            account: accountName,
-            group: quotaGroup,
-            attempt: attemptNum,
-            maxAttempts,
-            status: retryResp.status,
-            duration: retryDuration,
-          });
-          return retryResp;
-        }
-
-        if (retryResp.status !== 429) {
-          this.logUpstream(`重试返回非 429 错误`, {
-            method,
-            account: accountName,
-            group: quotaGroup,
-            attempt: attemptNum,
-            maxAttempts,
-            status: retryResp.status,
-            duration: retryDuration,
-          });
-          return retryResp;
-        }
-
-        lastResponse = retryResp;
-
-        // Still 429: if retryMs still missing, or retryMs > 5000ms, rotate.
-        let retryErrorText = "";
-        try {
-          retryErrorText = await retryResp.clone().text();
-        } catch (_) {}
-        const retryDetails = this.parseErrorDetails(retryErrorText);
-        const retryMs2 = this.parseRetryDelayMs(retryErrorText);
-
-        this.logQuota(`重试后仍然 429`, {
-          account: accountName,
-          group: quotaGroup,
-          resetDelay: retryMs2,
-        });
-
-        this.log("error", `🚫 Google API 429 错误详情 (重试)`, retryDetails);
-
-        if (retryMs2 != null && retryMs2 <= 5000) {
-          // Honor upstream short retry delay once.
-          const delay2 = Math.max(0, retryMs2 + 200);
-
-          this.logRetry("短时间限流，等待重试", {
-            attempt: attemptNum,
-            maxAttempts,
-            delayMs: delay2,
-            account: accountName,
-            nextAction: "同账户重试",
-          });
-
-          await this.sleep(delay2);
-
-          const retry2StartTime = Date.now();
-          let retry2Resp;
-          try {
-            retry2Resp = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
-              queryString,
-              headers,
-              limiter: this.auth.apiLimiter,
-            });
-          } catch (netErr3) {
-            const retry2Duration = Date.now() - retry2StartTime;
-            this.logError(`重试时网络错误`, netErr3, {
-              context: {
-                method: `v1internal:${method}`,
-                group: quotaGroup,
-                account: accountName,
-                attempt: attemptNum,
-                duration: retry2Duration,
-              },
-            });
-
-            this.logRetry("重试失败，轮换账户", {
-              attempt: attemptNum,
-              maxAttempts,
-              delayMs: FIXED_RETRY_DELAY_MS,
-              account: accountName,
-              error: netErr3.message || netErr3,
-              nextAction: "轮换到下一个账户",
-            });
-
-            if (this.auth && typeof this.auth.rotateAccount === "function") {
-              this.auth.rotateAccount(quotaGroup);
-            }
-            if (attemptNum < maxAttempts) {
-              await this.sleep(FIXED_RETRY_DELAY_MS);
-            }
-            continue;
-          }
-
-          const retry2Duration = Date.now() - retry2StartTime;
-
-          if (retry2Resp.ok) {
-            this.logUpstream(`重试成功`, {
-              method,
-              account: accountName,
-              group: quotaGroup,
-              attempt: attemptNum,
-              maxAttempts,
-              status: retry2Resp.status,
-              duration: retry2Duration,
-            });
-            return retry2Resp;
-          }
-
-          if (retry2Resp.status !== 429) {
-            this.logUpstream(`重试返回非 429 错误`, {
-              method,
-              account: accountName,
-              group: quotaGroup,
-              attempt: attemptNum,
-              maxAttempts,
-              status: retry2Resp.status,
-              duration: retry2Duration,
-            });
-            return retry2Resp;
-          }
-
-          lastResponse = retry2Resp;
-          retryMs = retryMs2;
-        } else {
-          retryMs = retryMs2;
-        }
-      } else if (retryMs != null && retryMs <= 5000) {
-        const delay = Math.max(0, retryMs + 200);
-        
-        this.logRetry("短时间限流，等待重试", {
-          attempt: attemptNum,
-          maxAttempts,
-          delayMs: delay,
-          account: accountName,
-          nextAction: "同账户重试",
-        });
-
-        await this.sleep(delay);
-
-        // Retry once on the same account with the same request body.
-        const retryStartTime = Date.now();
-        let retryResp;
-        try {
-          retryResp = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
-            queryString,
-            headers,
-            limiter: this.auth.apiLimiter,
-          });
-        } catch (netErr2) {
-          const retryDuration = Date.now() - retryStartTime;
-          this.logError(`重试时网络错误`, netErr2, {
-            context: {
-              method: `v1internal:${method}`,
-              group: quotaGroup,
-              account: accountName,
-              attempt: attemptNum,
-              duration: retryDuration,
-            },
-          });
-
-          this.logRetry("重试失败，轮换账户", {
-            attempt: attemptNum,
-            maxAttempts,
-            delayMs: FIXED_RETRY_DELAY_MS,
-            account: accountName,
-            error: netErr2.message || netErr2,
-            nextAction: "轮换到下一个账户",
-          });
-
-          if (this.auth && typeof this.auth.rotateAccount === "function") {
-            this.auth.rotateAccount(quotaGroup);
-          }
-          if (attemptNum < maxAttempts) {
-            await this.sleep(FIXED_RETRY_DELAY_MS);
-          }
-          continue;
-        }
-
-        const retryDuration = Date.now() - retryStartTime;
-
-        if (retryResp.ok) {
-          this.logUpstream(`重试成功`, {
-            method,
-            account: accountName,
-            group: quotaGroup,
-            attempt: attemptNum,
-            maxAttempts,
-            status: retryResp.status,
-            duration: retryDuration,
-          });
-          return retryResp;
-        }
-        
-        if (retryResp.status !== 429) {
-          this.logUpstream(`重试返回非 429 错误`, {
-            method,
-            account: accountName,
-            group: quotaGroup,
-            attempt: attemptNum,
-            maxAttempts,
-            status: retryResp.status,
-            duration: retryDuration,
-          });
-          return retryResp;
-        }
-
-        lastResponse = retryResp;
-        
-        this.logQuota(`重试后仍然 429`, {
-          account: accountName,
-          group: quotaGroup,
-        });
-      }
-
-      // Rotate to next account (either delay>5s, no delay, or retry still 429).
-      this.logRetry("需要轮换账户", {
-        attempt: attemptNum,
-        maxAttempts,
-        delayMs: retryMs,
-        account: accountName,
-        nextAction: retryMs && retryMs > 5000 ? `延迟过长 (${retryMs}ms)，轮换账户` : "轮换到下一个账户",
-      });
-
-      if (this.auth && typeof this.auth.rotateAccount === "function") {
-        this.auth.rotateAccount(quotaGroup);
-      }
-      if (attemptNum < maxAttempts) {
         await this.sleep(FIXED_RETRY_DELAY_MS);
+      } else {
+        this.logRetry("429 可解析重试信息，立即切换账户", {
+          attempt: attemptNum,
+          maxAttempts,
+          delayMs: retryMs,
+          account: accountName,
+          nextAction: "立即轮换到下一个账户",
+        });
       }
     }
 
-    // Exhausted: return the last upstream 429 response as-is (status/headers/body passthrough).
     if (lastResponse) {
       this.logError(`所有账户都已耗尽`, null, {
         context: {
           method: `v1internal:${method}`,
           group: quotaGroup,
           totalAttempts: maxAttempts,
+          model: modelId || options.model,
         },
       });
       return lastResponse;
     }
 
+    if (lastNetworkError) {
+      throw lastNetworkError;
+    }
+
+    const cached = modelId ? this.getCachedErrorResponse(modelId) : null;
+    if (cached) return cached;
+
     const error = new Error(`Upstream call exhausted without a response (v1internal:${method})`);
     error.status = 500;
     this.logError(`上游调用失败`, error, {
-      context: { method: `v1internal:${method}`, group: quotaGroup },
+      context: { method: `v1internal:${method}`, group: quotaGroup, model: modelId || options.model },
     });
     throw error;
   }
