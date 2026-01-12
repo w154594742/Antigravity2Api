@@ -1414,6 +1414,36 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
           if (role === "user") lastUserTaskTextNormalized = String(text).replace(/\s+/g, "");
         }
       }
+
+      // Claude tool-use protocol is strict: when the previous assistant message contains tool_use,
+      // the next user message must provide tool_result blocks immediately. If we mix MCP XML text
+      // results with regular functionResponse parts, ensure functionResponse (and their inlineData
+      // attachments) come first so upstream validation doesn't treat tool_results as "missing".
+      if (role === "user" && clientContent.parts.length > 0) {
+        const hasFunctionResponse = clientContent.parts.some((p) => p && p.functionResponse);
+        if (hasFunctionResponse) {
+          const reordered = [];
+          const deferred = [];
+          for (let i = 0; i < clientContent.parts.length; i++) {
+            const part = clientContent.parts[i];
+            if (part && part.functionResponse) {
+              reordered.push(part);
+              while (
+                i + 1 < clientContent.parts.length &&
+                clientContent.parts[i + 1] &&
+                typeof clientContent.parts[i + 1] === "object" &&
+                clientContent.parts[i + 1].inlineData
+              ) {
+                reordered.push(clientContent.parts[i + 1]);
+                i++;
+              }
+              continue;
+            }
+            deferred.push(part);
+          }
+          clientContent.parts = [...reordered, ...deferred];
+        }
+      }
       
       if (clientContent.parts.length > 0) {
         contents.push(clientContent);
