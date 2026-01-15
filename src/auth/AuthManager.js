@@ -5,68 +5,24 @@ const RateLimiter = require("./RateLimiter");
 const TokenRefresher = require("./TokenRefresher");
 const httpClient = require("./httpClient");
 
-function generateProjectId() {
-  // 生成类似 "fabled-setup-3dmkj" 的格式：word-word-5位随机
-  const adjectives = [
-    "fabled",
-    "spry",
-    "apt",
-    "astral",
-    "infra",
-    "brisk",
-    "calm",
-    "daring",
-    "eager",
-    "gentle",
-    "lively",
-    "noble",
-    "quick",
-    "rural",
-    "solar",
-    "tidy",
-    "vivid",
-    "witty",
-    "young",
-    "zesty",
-  ];
-  const nouns = [
-    "setup",
-    "post",
-    "site",
-    "scout",
-    "battery",
-    "arbor",
-    "beacon",
-    "canyon",
-    "delta",
-    "ember",
-    "grove",
-    "harbor",
-    "meadow",
-    "nexus",
-    "prairie",
-    "ridge",
-    "savanna",
-    "tundra",
-    "valley",
-    "willow",
-  ];
-  const adj = adjectives[Math.floor(Math.random() * adjectives.length)];
-  const noun = nouns[Math.floor(Math.random() * nouns.length)];
-  // 生成 5 位 base36 随机串
-  let suffix = "";
-  while (suffix.length < 5) {
-    suffix += require("crypto").randomBytes(4).readUInt32BE().toString(36);
-  }
-  suffix = suffix.slice(0, 5);
-  return `${adj}-${noun}-${suffix}`;
-}
-
 function normalizeQuotaGroup(group) {
   const g = String(group || "").trim().toLowerCase();
   if (g === "claude") return "claude";
   if (g === "gemini") return "gemini";
   return "gemini";
+}
+
+function isValidProjectId(projectId) {
+  const value = typeof projectId === "string" ? projectId.trim() : "";
+  // Cloud Code may return either a resource name (projects/.../locations/...) or a short id.
+  return value.length > 0;
+}
+
+function hasProjectIdRepairMarker(creds) {
+  const value = creds?.projectIdResolvedAt;
+  if (typeof value === "number" && Number.isFinite(value)) return true;
+  if (typeof value === "string" && value.trim()) return true;
+  return false;
 }
 
 function sanitizeCredentialFileName(fileName) {
@@ -90,7 +46,6 @@ class AuthManager {
     this.logger = options.logger || null;
     // Ensure v1internal requests are spaced >= 1 * 1000ms.
     this.apiLimiter = options.rateLimiter || new RateLimiter(1 * 1000);
-    this.lastLoadCodeAssistBody = null;
 
     this.tokenRefresher = new TokenRefresher({
       logger: this.logger,
@@ -98,6 +53,7 @@ class AuthManager {
     });
 
     this.initialTokenRefreshPromise = null;
+    this.initialProjectIdRefreshPromise = null;
   }
 
   setLogger(logger) {
@@ -248,6 +204,14 @@ class AuthManager {
       this.initialTokenRefreshPromise = this.tokenRefresher
         ? this.tokenRefresher.refreshDueAccountsNow().catch(() => {})
         : Promise.resolve();
+
+      // Best-effort: refresh/repair projectId for all loaded accounts.
+      this.initialProjectIdRefreshPromise = (async () => {
+        try {
+          await this.waitInitialTokenRefresh();
+        } catch (_) {}
+        await this.refreshAllProjectIds();
+      })().catch(() => {});
     } catch (err) {
       this.log("error", `Error loading accounts: ${err.message || err}`);
     }
@@ -257,6 +221,76 @@ class AuthManager {
     if (this.initialTokenRefreshPromise) {
       await this.initialTokenRefreshPromise;
     }
+  }
+
+  async waitInitialProjectIdRefresh() {
+    if (this.initialProjectIdRefreshPromise) {
+      await this.initialProjectIdRefreshPromise;
+    }
+  }
+
+  async refreshAllProjectIds() {
+    const count = this.getAccountCount();
+    if (!count) return { ok: 0, fail: 0, total: 0 };
+
+    const perAccount = [];
+    for (let i = 0; i < count; i++) {
+      perAccount.push(
+        (async () => {
+          const account = this.accounts[i];
+          const accountName = account?.filePath ? path.basename(account.filePath) : `account_${i}`;
+          try {
+            if (account?.creds && isValidProjectId(account.creds.projectId) && hasProjectIdRepairMarker(account.creds)) {
+              return { ok: true, accountName, skipped: true };
+            }
+
+            const token = await this.getAccessTokenByIndex(i, "project-repair");
+            const accessToken = token?.accessToken;
+            if (!accessToken) {
+              throw new Error("Missing access_token");
+            }
+
+            // Be aggressive (like quota refresh): do not use the shared v1internal RateLimiter.
+            const projectId = await httpClient.fetchProjectId(accessToken, null, { maxAttempts: 3 });
+            if (!isValidProjectId(projectId)) {
+              throw new Error(`Invalid projectId: ${String(projectId || "")}`.trim());
+            }
+
+            if (!account?.creds) {
+              throw new Error("Account not loaded");
+            }
+            const needsWrite =
+              account.creds.projectId !== projectId || !hasProjectIdRepairMarker(account.creds);
+            account.creds.projectId = projectId;
+            account.creds.projectIdResolvedAt = new Date().toISOString();
+            if (needsWrite) {
+              await fs.writeFile(account.filePath, JSON.stringify(account.creds, null, 2));
+            }
+
+            return { ok: true, accountName };
+          } catch (e) {
+            return { ok: false, accountName, error: e };
+          }
+        })()
+      );
+    }
+
+    const results = await Promise.all(perAccount);
+
+    let ok = 0;
+    let fail = 0;
+    for (const r of results) {
+      if (r?.ok) {
+        ok++;
+        continue;
+      }
+      fail++;
+      const msg = String(r?.error?.message || r?.error || "unknown error").split("\n")[0].slice(0, 200);
+      this.log("warn", `⚠️ projectId 修复失败 @${r?.accountName || "unknown-account"}${msg ? ` (${msg})` : ""}`);
+    }
+
+    this.log("info", `projectId 修复完成 ok=${ok} fail=${fail}`);
+    return { ok, fail, total: count };
   }
 
   async reloadAccounts() {
@@ -276,41 +310,25 @@ class AuthManager {
   }
 
   async fetchProjectId(accessToken) {
-    const { projectId, rawBody } = await httpClient.fetchProjectId(accessToken, this.apiLimiter);
-    this.lastLoadCodeAssistBody = rawBody;
-    return projectId;
+    return httpClient.fetchProjectId(accessToken, this.apiLimiter, { maxAttempts: 3 });
   }
 
   async ensureProjectId(account) {
-    if (account.creds.projectId) {
-      return account.creds.projectId;
-    }
+    const existing = account?.creds?.projectId;
+    if (isValidProjectId(existing) && hasProjectIdRepairMarker(account?.creds)) return existing.trim();
 
     if (account.projectPromise) {
       return account.projectPromise;
     }
 
     account.projectPromise = (async () => {
-      let projectId = account.creds.projectId;
-
-      if (!projectId) {
-        projectId = await this.fetchProjectId(account.creds.access_token);
-      }
-
-      if (!projectId) {
-        const lastRaw = this.lastLoadCodeAssistBody;
-        const hasPaidTier = lastRaw && lastRaw.includes('"paidTier"');
-        if (hasPaidTier) {
-          projectId = generateProjectId();
-          this.log("warn", `loadCodeAssist 无 projectId，但检测到 paidTier，使用随机 projectId: ${projectId}`);
-        }
-      }
-
-      if (!projectId) {
-        throw new Error("Account is not eligible (projectId missing)");
+      const projectId = await this.fetchProjectId(account.creds.access_token);
+      if (!isValidProjectId(projectId)) {
+        throw new Error(`Failed to obtain valid projectId: ${String(projectId || "")}`.trim());
       }
 
       account.creds.projectId = projectId;
+      account.creds.projectIdResolvedAt = new Date().toISOString();
       await fs.writeFile(account.filePath, JSON.stringify(account.creds, null, 2));
       this.log("info", `✅ 获取 projectId 成功: ${projectId}`);
       return projectId;
@@ -444,19 +462,13 @@ class AuthManager {
       await fs.mkdir(this.authDir, { recursive: true });
     }
 
-    // Fetch projectId：先尝试 API 获取；如果没有，且检测到 paidTier 则随机生成
-    let projectId = await this.fetchProjectId(formattedData.access_token);
-    if (!projectId) {
-      const hasPaidTier = this.lastLoadCodeAssistBody && this.lastLoadCodeAssistBody.includes('"paidTier"');
-      if (hasPaidTier) {
-        projectId = generateProjectId();
-        this.log("warn", `loadCodeAssist 无 projectId，但检测到 paidTier，使用随机 projectId: ${projectId}`);
-      }
-    }
-    if (!projectId) {
-      throw new Error("Failed to obtain projectId, account is not eligible");
+    // Adding an account requires a valid projectId.
+    const projectId = await this.fetchProjectId(formattedData.access_token);
+    if (!isValidProjectId(projectId)) {
+      throw new Error(`Failed to obtain valid projectId, account is not eligible: ${String(projectId || "")}`.trim());
     }
     formattedData.projectId = projectId;
+    formattedData.projectIdResolvedAt = new Date().toISOString();
     this.log("info", `✅ 项目ID获取成功: ${projectId}`);
 
     const email = formattedData.email;
@@ -573,27 +585,19 @@ class AuthManager {
           data.email = account.creds.email;
         }
 
-        // 补全 projectId（刷新可能首次需要）
-        if (account.creds.projectId) {
-          data.projectId = account.creds.projectId;
+        // Ensure projectId; do not generate random IDs.
+        const existingProjectId = account.creds.projectId;
+        if (isValidProjectId(existingProjectId) && hasProjectIdRepairMarker(account.creds)) {
+          data.projectId = existingProjectId.trim();
+          data.projectIdResolvedAt = account.creds.projectIdResolvedAt;
         } else {
           const projectId = await this.fetchProjectId(data.access_token);
-          if (!projectId) {
-            const hasPaidTier =
-              this.lastLoadCodeAssistBody && this.lastLoadCodeAssistBody.includes('"paidTier"');
-            if (hasPaidTier) {
-              data.projectId = generateProjectId();
-              this.log(
-                "warn",
-                `⚠️ 刷新时 loadCodeAssist 无 projectId，但检测到 paidTier，使用随机 projectId: ${data.projectId}`
-              );
-            } else {
-              throw new Error("Failed to obtain projectId during refresh");
-            }
-          } else {
-            data.projectId = projectId;
-            this.log("info", `✅ 刷新时获取 projectId 成功: ${projectId}`);
+          if (!isValidProjectId(projectId)) {
+            throw new Error(`Failed to obtain valid projectId during refresh: ${String(projectId || "")}`.trim());
           }
+          data.projectId = projectId;
+          data.projectIdResolvedAt = new Date().toISOString();
+          this.log("info", `✅ 刷新时获取 projectId 成功: ${projectId}`);
         }
 
         account.creds = data;
