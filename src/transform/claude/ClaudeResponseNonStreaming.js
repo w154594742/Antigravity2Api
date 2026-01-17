@@ -17,6 +17,9 @@ class NonStreamingProcessor {
     // trailingSignature: 来自空普通文本的 part，在 process() 末尾用空 thinking 块承载
     this.thinkingSignature = null;
     this.trailingSignature = null;
+    // 上游偶发：thought:true 的空 part 携带 thoughtSignature，后面紧跟 functionCall。
+    // 对下游（Claude JSON）应表现为 thinking.signature，但我们仍需把它缓存为该 tool_use 的签名，供下一轮请求回填。
+    this.pendingToolThoughtSignature = null;
 
     const mcpXmlToolNames = Array.isArray(options?.mcpXmlToolNames) ? options.mcpXmlToolNames : [];
     this.mcpXmlParser =
@@ -65,10 +68,22 @@ class NonStreamingProcessor {
   processPart(part) {
     const signature = part.thoughtSignature;
 
+    // pendingToolThoughtSignature 只用于“紧随空 thought part 的下一次 functionCall”。
+    // 如果中间出现了非 functionCall 的实际内容（例如普通 text），则清空，避免误绑定到后续无关工具调用。
+    const isEmptyThoughtPart = part?.thought && part?.text !== undefined && String(part.text).length === 0;
+    if (this.pendingToolThoughtSignature && !part.functionCall && !isEmptyThoughtPart) {
+      this.pendingToolThoughtSignature = null;
+    }
+
     // FC 处理：先刷新之前的内容，再处理 FC（防止 FC 签名污染 thinking 块）
     if (part.functionCall) {
-      // 根据官方文档（PDF 44行）：签名必须原样返回到收到签名的那个 part
-      // thinking 的签名留在 thinking 块，FC 的签名留在 FC 块
+      // 对下游（Claude JSON）：签名应放在 thinking.signature（在 tool_use 之前），tool_use 不携带 signature 字段。
+      // 但仍需缓存 tool_use.id -> signature，供下一轮请求回填到 Gemini functionCall part。
+
+      // 若签名出现在 functionCall part 上，尽量把它作为“thinking 的签名”输出在 tool_use 之前。
+      if (signature && this.hasThinking) {
+        this.thinkingSignature = signature;
+      }
       this.flushThinking();
       this.flushText();
 
@@ -99,10 +114,10 @@ class NonStreamingProcessor {
         input: part.functionCall.args || {},
       };
 
-      // 只使用 FC 自己的签名
-      if (signature) {
-        toolUseBlock.signature = signature;
-        rememberToolThoughtSignature(toolId, signature);
+      const sigForToolCache = signature || this.pendingToolThoughtSignature;
+      this.pendingToolThoughtSignature = null;
+      if (sigForToolCache) {
+        rememberToolThoughtSignature(toolId, sigForToolCache);
       }
 
       this.contentBlocks.push(toolUseBlock);
@@ -132,6 +147,8 @@ class NonStreamingProcessor {
         // thinking 的签名暂存到 thinkingSignature，在 flushThinking 时消费
         if (signature) {
           this.thinkingSignature = signature;
+          // 空 thought part 的签名可能对应后续的 functionCall：额外暂存一份用于 tool_use.id -> signature 缓存。
+          if (part.text.length === 0) this.pendingToolThoughtSignature = signature;
         }
       } else {
         // 根据官方规范（PDF 行44）：签名必须在收到它的 part 位置返回

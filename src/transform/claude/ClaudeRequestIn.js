@@ -184,6 +184,14 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
       // thought parts (and leaking late "thinking" as plain text).
       let sawNonThinkingContent = false;
       let previousWasToolResult = false;
+      // Claude thinking.signature -> Gemini thoughtSignature 的归属：在该项目里，签名应附着到同一条 assistant
+      // message 中「紧随 thinking 的下一个输出 part」，且当该 message 存在 tool_use 时优先附着到第一个 functionCall part。
+      // 这是为了匹配 ai.google.dev Thought Signatures 的示例：签名出现在 functionCall/text part 上，而非 thought part 上。
+      let pendingThoughtSignature = null;
+      const messageHasFunctionCallToolUse =
+        role === "model" &&
+        Array.isArray(msg.content) &&
+        msg.content.some((it) => it && it.type === "tool_use" && !(mcpXmlEnabled && isMcpToolName(it?.name)));
 
       if (Array.isArray(msg.content)) {
         for (const item of msg.content) {
@@ -200,7 +208,18 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
               previousWasToolResult = false;
               continue;
             }
-            clientContent.parts.push({ text });
+            const part = { text };
+            if (
+              pendingThoughtSignature &&
+              shouldForwardThoughtSignatures &&
+              role === "model" &&
+              !messageHasFunctionCallToolUse &&
+              !part.thoughtSignature
+            ) {
+              part.thoughtSignature = pendingThoughtSignature;
+              pendingThoughtSignature = null;
+            }
+            clientContent.parts.push(part);
             sawNonThinkingContent = true;
             previousWasToolResult = false;
             if (role === "user") lastUserTaskTextNormalized = text.replace(/\s+/g, "");
@@ -211,31 +230,28 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
             const thinkingText = typeof item.thinking === "string" ? item.thinking : "";
             const signature = typeof item.signature === "string" ? item.signature : "";
 
-            if (signature && thinkingText.length === 0) {
-              // 文本签名载体块：严格按官方参考行为合并回“前一个非空 text part”（绝不附着到 functionCall）。
-              if (!shouldForwardThoughtSignatures) continue;
-              for (let i = clientContent.parts.length - 1; i >= 0; i--) {
-                const p = clientContent.parts[i];
-                const canCarry =
-                  p && p.thought !== true && !p.thoughtSignature && typeof p.text === "string" && p.text.length > 0;
-                if (!canCarry) continue;
-                p.thoughtSignature = signature;
-                break;
+            // 避免请求侧发送空字符串字段（部分上游会直接 400）
+            if (thinkingText.length === 0) {
+              // signature-only thinking block：用作签名载体，等待附着到下一个输出 part；
+              // 若本条 message 后续没有可承载的输出 part，再在 message 末尾兜底回填。
+              if (signature && shouldForwardThoughtSignatures) {
+                pendingThoughtSignature = signature;
               }
               continue;
             }
 
-            // 避免请求侧发送空字符串字段（部分上游会直接 400）
-            if (thinkingText.length === 0) continue;
-
             // thinking blocks must be leading within the assistant message.
             if (sawNonThinkingContent) continue;
 
-            // Claude 上游在开启 thinking 时会校验签名；如果历史里出现 thinking 但没有 signature，
-            // 继续以 thought=true 回传会直接 400（messages.*.thinking.signature: Field required）。
-            // 这种情况下只能降级为普通 text part，避免破坏整体链路（不影响已有的签名转发逻辑）。
+            // 记录签名，后续尽量附着到紧随其后的非 thought part（text / functionCall）。
             if (signature && shouldForwardThoughtSignatures) {
-              clientContent.parts.push({ text: thinkingText, thought: true, thoughtSignature: signature });
+              pendingThoughtSignature = signature;
+            }
+
+            // 注意：签名不附着到 thought part，保持与官方示例一致（签名在 functionCall/text part）。
+            // 当禁用签名转发时，降级为普通 text part，避免跨模型段污染。
+            if (shouldForwardThoughtSignatures) {
+              clientContent.parts.push({ text: thinkingText, thought: true });
             } else {
               clientContent.parts.push({ text: thinkingText });
               sawNonThinkingContent = true;
@@ -287,12 +303,26 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
             if (typeof item.signature === "string" && item.signature) {
               deleteToolThoughtSignature(item.id);
             }
-            // 如果 tool_use 有 signature（少数客户端会回传），直接使用；
-            // 否则从缓存补回（Claude Code 不会回传 tool_use.signature）。
-            const sig = item.signature || getToolThoughtSignature(item.id);
-            if (sig && shouldForwardThoughtSignatures) {
+            const pendingSig = shouldForwardThoughtSignatures ? pendingThoughtSignature : null;
+
+            // 优先使用“下游回传”的签名（tool_use.signature 或紧邻的 thinking.signature），保证严格按收到的值回放。
+            // 只有当下游没有回传时，才从本地缓存补回（Claude Code 通常不会回传 tool_use.signature）。
+            let sig = null;
+            if (typeof item.signature === "string" && item.signature) {
+              sig = item.signature;
+            } else if (pendingSig) {
+              sig = pendingSig;
+              // 下游已经回传了该 tool_use 的签名（以 thinking.signature 的形式），本地缓存不再需要，立即清理。
+              if (item.id) deleteToolThoughtSignature(item.id);
+            } else {
+              sig = getToolThoughtSignature(item.id);
+            }
+
+            // 消费 pending：无论是否使用（例如 tool_use 已自带签名），都认为已到达“thinking 之后的第一个输出 part”。
+            if (pendingSig) pendingThoughtSignature = null;
+            if (sig && shouldForwardThoughtSignatures && !fcPart.thoughtSignature) {
               fcPart.thoughtSignature = sig;
-              if (!item.signature && isDebugEnabled()) {
+              if (!item.signature && isDebugEnabled() && item.id && sig !== pendingSig) {
                 console.log(`[ThoughtSignature] injected tool_use.id=${item.id}`);
               }
             }
@@ -350,6 +380,24 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
         if (text) {
           clientContent.parts.push({ text });
           if (role === "user") lastUserTaskTextNormalized = String(text).replace(/\s+/g, "");
+        }
+      }
+
+      // 如果遇到“signature-only thinking block”但后面没有任何可承载的输出 part，作为兜底把签名回填到上一条可承载的 part。
+      if (pendingThoughtSignature && shouldForwardThoughtSignatures && role === "model") {
+        for (let i = clientContent.parts.length - 1; i >= 0; i--) {
+          const p = clientContent.parts[i];
+          if (!p || typeof p !== "object" || p.thoughtSignature) continue;
+          if (p.functionCall) {
+            p.thoughtSignature = pendingThoughtSignature;
+            pendingThoughtSignature = null;
+            break;
+          }
+          if (typeof p.text === "string" && p.thought !== true && p.text.length > 0) {
+            p.thoughtSignature = pendingThoughtSignature;
+            pendingThoughtSignature = null;
+            break;
+          }
         }
       }
 

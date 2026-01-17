@@ -52,6 +52,9 @@ class StreamingState {
     this.hasThinking = false;
     this.signatures = new SignatureManager(); // thinking/FC 签名
     this.trailingSignature = null; // 空 text 带签名（必须单独用空 thinking 块承载）
+    // 上游偶发：thought:true 的空 part 携带 thoughtSignature，后面紧跟 functionCall。
+    // 对下游（Claude SSE）应表现为 thinking 的 signature_delta，但我们仍需把它缓存为该 tool_use 的签名，供下一轮请求回填。
+    this.pendingToolThoughtSignature = null;
 
     // web_search（grounding）专用：先实时输出 thinking，再在 finish 时补齐 server_tool_use / tool_result / citations / 最终文本
     this.webSearchMode = false;
@@ -199,6 +202,13 @@ class PartProcessor {
   process(part) {
     const signature = part.thoughtSignature;
 
+    // pendingToolThoughtSignature 只用于“紧随空 thought part 的下一次 functionCall”。
+    // 如果中间出现了非 functionCall 的实际内容（例如普通 text），则清空，避免误绑定到后续无关工具调用。
+    const isEmptyThoughtPart = part?.thought && part?.text !== undefined && String(part.text).length === 0;
+    if (this.state.pendingToolThoughtSignature && !part.functionCall && !isEmptyThoughtPart) {
+      this.state.pendingToolThoughtSignature = null;
+    }
+
     // 函数调用处理
     // 根据官方文档（PDF 44行）：签名必须原样返回到收到签名的那个 part
     // - Gemini 3 Pro：签名在第一个 FC（PDF 784行）
@@ -217,7 +227,17 @@ class PartProcessor {
         }
         this.state.trailingSignature = null;
       }
-      this.processFunctionCall(part.functionCall, signature);
+
+      const sigForToolCache = signature || this.state.pendingToolThoughtSignature;
+      this.state.pendingToolThoughtSignature = null;
+
+      // 对下游（Claude SSE）：签名应跟随 thinking 的 signature_delta，而非挂到 tool_use 上。
+      // 若签名出现在 functionCall part 上，尽量把它作为“thinking 的签名”输出在 tool_use 之前。
+      if (signature && this.state.blockType === StreamingState.BLOCK_THINKING) {
+        this.state.signatures.store(signature);
+      }
+
+      this.processFunctionCall(part.functionCall, sigForToolCache);
       return;
     }
 
@@ -248,6 +268,8 @@ class PartProcessor {
         // 签名暂存，在 thinking 块结束时发送
         if (signature) {
           this.state.signatures.store(signature);
+          // 空 thought part 的签名可能对应后续的 functionCall：额外暂存一份用于 tool_use.id -> signature 缓存。
+          if (part.text.length === 0) this.state.pendingToolThoughtSignature = signature;
         }
       } else {
         // 非 thinking text 场景
@@ -343,8 +365,9 @@ class PartProcessor {
   }
 
   // 处理函数调用
-  processFunctionCall(fc, sigToUse) {
-    // 签名已在 process() 中处理：FC 自带签名优先，否则使用 thinking 暂存的签名
+  processFunctionCall(fc, sigForToolCache) {
+    // 对下游（Claude SSE）：签名通过 thinking.signature_delta 输出；tool_use 不携带 signature 字段。
+    // 但仍需缓存 tool_use.id -> signature，供下一轮请求回填到 Gemini functionCall part。
     const toolId = typeof fc.id === "string" && fc.id ? fc.id : makeToolUseId();
 
     const toolUseBlock = {
@@ -354,10 +377,8 @@ class PartProcessor {
       input: {},
     };
 
-    // 根据官方文档：签名附加到 tool_use 块
-    if (sigToUse) {
-      toolUseBlock.signature = sigToUse;
-      rememberToolThoughtSignature(toolId, sigToUse);
+    if (sigForToolCache) {
+      rememberToolThoughtSignature(toolId, sigForToolCache);
     }
 
     this.state.startBlock(StreamingState.BLOCK_FUNCTION, toolUseBlock);
