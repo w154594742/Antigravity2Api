@@ -63,7 +63,10 @@
       </section>
 
       <section class="card">
-        <h2>账号列表</h2>
+        <div class="card-header-row">
+          <h2>账号列表</h2>
+          <button id="btnRefreshAllQuotas" class="btn small primary">🔄 一键刷新额度</button>
+        </div>
         <div id="accountsMeta" class="hint"></div>
         <div class="tableWrap">
           <table class="table">
@@ -72,6 +75,11 @@
                 <th>文件</th>
                 <th>Email</th>
                 <th>Project ID</th>
+                <th>
+                  <span>额度</span>
+                  <button id="sortClaude" class="btn sort-btn small">Claude</button>
+                  <button id="sortGemini" class="btn sort-btn small">Gemini</button>
+                </th>
                 <th>过期时间</th>
                 <th>操作</th>
               </tr>

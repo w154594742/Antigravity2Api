@@ -8,6 +8,7 @@
     keyStatus: $("keyStatus"),
     btnReload: $("btnReload"),
     btnAdd: $("btnAdd"),
+    btnRefreshAllQuotas: $("btnRefreshAllQuotas"),
     oauthStatus: $("oauthStatus"),
     oauthUrl: $("oauthUrl"),
     oauthState: $("oauthState"),
@@ -27,7 +28,17 @@
   const state = {
     apiKey: "",
     oauth: { state: null, url: null },
+    quotaByAccount: {},               // 缓存各账号的额度数据
+    quotaRefreshingAll: false,        // 一键刷新按钮防抖状态
+    quotaRefreshingSingle: {},        // 单账号刷新防抖状态（key 为文件名）
+    sortBy: null,                     // 当前排序依据：null | "claude" | "gemini"
+    sortOrder: "desc",                // 排序方向："desc" 降序 | "asc" 升序
+    lastAccountsPayload: null,        // 缓存最后一次账号数据，用于重新排序渲染
   };
+
+  // 防抖时间配置（毫秒）
+  const DEBOUNCE_ALL = 3000;
+  const DEBOUNCE_SINGLE = 2000;
 
   let oauthPollTimer = null;
 
@@ -126,7 +137,248 @@
 	    return formatLocalDateTime(expiryDateMs);
 	  }
 
+  // 渲染单个账号的额度信息到表格单元格
+  function renderQuotaInline(quotaList, cellEl, fileName) {
+    cellEl.innerHTML = "";
+    cellEl.className = "quota-cell";
+
+    if (!quotaList || quotaList.length === 0) {
+      cellEl.innerHTML = '<span class="quota-loading">-</span>';
+      return;
+    }
+
+    // 按 shortName 去重，同类模型共用额度池，只取第一条
+    const seen = new Set();
+    const uniqueList = quotaList.filter(q => {
+      if (seen.has(q.shortName)) return false;
+      seen.add(q.shortName);
+      return true;
+    });
+
+    const container = document.createElement("div");
+    container.className = "quota-list";
+
+    for (const q of uniqueList) {
+      const row = document.createElement("div");
+      row.className = "quota-item";
+
+      // 模型简称（带颜色标识）
+      const modelSpan = document.createElement("span");
+      modelSpan.className = `quota-model ${q.shortName}`;
+      modelSpan.textContent = q.shortName;
+      row.appendChild(modelSpan);
+
+      // 进度条容器
+      const barWrap = document.createElement("div");
+      barWrap.className = "quota-bar-wrap";
+      const bar = document.createElement("div");
+      bar.className = "quota-bar";
+
+      // 根据剩余比例设置进度条宽度和颜色
+      const fraction = q.remainingFraction ?? 0;
+      const percent = Math.round(fraction * 100);
+      bar.style.width = `${percent}%`;
+
+      // 颜色等级：>50% 绿色，20%-50% 黄色，<20% 红色
+      if (fraction > 0.5) {
+        bar.classList.add("high");
+      } else if (fraction > 0.2) {
+        bar.classList.add("medium");
+      } else {
+        bar.classList.add("low");
+      }
+      barWrap.appendChild(bar);
+      row.appendChild(barWrap);
+
+      // 百分比数值
+      const percentSpan = document.createElement("span");
+      percentSpan.className = "quota-percent";
+      percentSpan.textContent = q.limit || "-";
+      row.appendChild(percentSpan);
+
+      // 重置时间
+      const resetSpan = document.createElement("span");
+      resetSpan.className = "quota-reset";
+      resetSpan.textContent = q.resetShort || "";
+      row.appendChild(resetSpan);
+
+      // 预估调用次数
+      if (q.estimatedCalls !== null && q.estimatedCalls !== undefined) {
+        const callsSpan = document.createElement("span");
+        callsSpan.className = "quota-calls";
+        callsSpan.textContent = `~${q.estimatedCalls}`;
+        row.appendChild(callsSpan);
+      }
+
+      container.appendChild(row);
+    }
+
+    cellEl.appendChild(container);
+  }
+
+  // 一键刷新所有账号额度（带防抖）
+  async function refreshAllQuotas() {
+    if (state.quotaRefreshingAll) return;
+    state.quotaRefreshingAll = true;
+
+    const btn = els.btnRefreshAllQuotas;
+    if (btn) {
+      btn.classList.add("refreshing");
+      btn.disabled = true;
+    }
+
+    try {
+      const res = await apiFetch("/admin/api/accounts/quotas/refresh", { method: "POST", body: "{}" });
+      if (res.data) {
+        state.quotaByAccount = res.data;
+        updateQuotaCellsFromCache();
+      }
+    } catch (e) {
+      console.error("刷新所有额度失败:", e);
+    }
+
+    // 防抖延时恢复
+    setTimeout(() => {
+      state.quotaRefreshingAll = false;
+      if (btn) {
+        btn.classList.remove("refreshing");
+        btn.disabled = false;
+      }
+    }, DEBOUNCE_ALL);
+  }
+
+  // 刷新单个账号额度（带防抖）
+  async function refreshSingleQuota(fileName, btnEl, cellEl) {
+    if (state.quotaRefreshingSingle[fileName]) return;
+    state.quotaRefreshingSingle[fileName] = true;
+
+    if (btnEl) {
+      btnEl.classList.add("refreshing");
+      btnEl.disabled = true;
+    }
+
+    try {
+      const res = await apiFetch(`/admin/api/accounts/${encodeURIComponent(fileName)}/quota/refresh`, {
+        method: "POST",
+        body: "{}",
+      });
+      if (res.data) {
+        state.quotaByAccount[fileName] = res.data;
+        renderQuotaInline(res.data, cellEl, fileName);
+      }
+    } catch (e) {
+      console.error(`刷新账号 ${fileName} 额度失败:`, e);
+    }
+
+    // 防抖延时恢复按钮状态
+    setTimeout(() => {
+      state.quotaRefreshingSingle[fileName] = false;
+      if (btnEl) {
+        btnEl.classList.remove("refreshing");
+        btnEl.disabled = false;
+      }
+    }, DEBOUNCE_SINGLE);
+  }
+
+  // 根据缓存数据更新所有额度单元格
+  function updateQuotaCellsFromCache() {
+    const rows = els.accountsBody.querySelectorAll("tr");
+    rows.forEach((row) => {
+      const fileCell = row.querySelector("td:first-child");
+      const quotaCell = row.querySelector("td.quota-cell");
+      if (fileCell && quotaCell) {
+        const fileName = fileCell.textContent.trim();
+        const quotaData = state.quotaByAccount[fileName];
+        if (quotaData) {
+          renderQuotaInline(quotaData, quotaCell, fileName);
+        }
+      }
+    });
+  }
+
+  // 获取所有账号额度（用于初始化加载）
+  async function fetchAllQuotas() {
+    try {
+      const res = await apiFetch("/admin/api/accounts/quotas", { method: "GET" });
+      if (res.data) {
+        state.quotaByAccount = res.data;
+        updateQuotaCellsFromCache();
+      }
+    } catch (e) {
+      console.error("获取额度信息失败:", e);
+    }
+  }
+
+  // 获取账号指定模型的剩余额度比例
+  function getQuotaFraction(fileName, modelType) {
+    const quotaList = state.quotaByAccount[fileName];
+    if (!quotaList || quotaList.length === 0) return null;
+    const item = quotaList.find(q => q.shortName === modelType);
+    return item?.remainingFraction ?? null;
+  }
+
+  // 按额度排序账号列表
+  function sortAccountsByQuota(accounts) {
+    if (!state.sortBy || !accounts || accounts.length === 0) {
+      return accounts;
+    }
+
+    const modelType = state.sortBy; // "claude" 或 "gemini"
+    const multiplier = state.sortOrder === "desc" ? -1 : 1;
+
+    return [...accounts].sort((a, b) => {
+      const fracA = getQuotaFraction(a.file, modelType);
+      const fracB = getQuotaFraction(b.file, modelType);
+
+      // 无额度数据的排在最后
+      if (fracA === null && fracB === null) return 0;
+      if (fracA === null) return 1;
+      if (fracB === null) return -1;
+
+      return (fracA - fracB) * multiplier;
+    });
+  }
+
+  // 切换排序状态
+  function toggleSort(modelType) {
+    if (state.sortBy === modelType) {
+      // 同一按钮：切换升序/降序
+      state.sortOrder = state.sortOrder === "desc" ? "asc" : "desc";
+    } else {
+      // 不同按钮：切换到新模型，默认降序
+      state.sortBy = modelType;
+      state.sortOrder = "desc";
+    }
+    // 更新排序按钮显示
+    updateSortButtons();
+    // 重新渲染账号列表
+    if (state.lastAccountsPayload) {
+      renderAccounts(state.lastAccountsPayload);
+    }
+  }
+
+  // 更新排序按钮显示状态
+  function updateSortButtons() {
+    const claudeBtn = document.getElementById("sortClaude");
+    const geminiBtn = document.getElementById("sortGemini");
+    if (claudeBtn) {
+      claudeBtn.textContent = state.sortBy === "claude"
+        ? (state.sortOrder === "desc" ? "Claude ↓" : "Claude ↑")
+        : "Claude";
+      claudeBtn.classList.toggle("active", state.sortBy === "claude");
+    }
+    if (geminiBtn) {
+      geminiBtn.textContent = state.sortBy === "gemini"
+        ? (state.sortOrder === "desc" ? "Gemini ↓" : "Gemini ↑")
+        : "Gemini";
+      geminiBtn.classList.toggle("active", state.sortBy === "gemini");
+    }
+  }
+
   function renderAccounts(payload) {
+    // 缓存原始数据，用于重新排序时渲染
+    state.lastAccountsPayload = payload;
+
     const { count, current, accounts } = payload || {};
     const total = count || 0;
     const claudeIndex = total > 0 ? (current?.claude ?? 0) + 1 : 0;
@@ -137,14 +389,16 @@
     if (!accounts || accounts.length === 0) {
       const tr = document.createElement("tr");
       const td = document.createElement("td");
-      td.colSpan = 5;
-      td.textContent = "暂无账号，请先点击 “OAuth 添加账号”。";
+      td.colSpan = 6;  // 增加到6列（含额度列）
+      td.textContent = '暂无账号，请先点击 "OAuth 添加账号"。';
       tr.appendChild(td);
       els.accountsBody.appendChild(tr);
       return;
     }
 
-    for (const acc of accounts) {
+    // 应用排序后遍历渲染
+    const sortedAccounts = sortAccountsByQuota(accounts);
+    for (const acc of sortedAccounts) {
       const tr = document.createElement("tr");
 
       const fileTd = document.createElement("td");
@@ -158,27 +412,21 @@
       pidTd.className = "mono";
       pidTd.textContent = acc.projectId || "-";
 
+      // 额度列（内联显示）
+      const quotaTd = document.createElement("td");
+      quotaTd.className = "quota-cell";
+      quotaTd.innerHTML = '<span class="quota-loading">加载中...</span>';
+      // 稍后由 fetchAllQuotas 填充数据
+
       const expTd = document.createElement("td");
       expTd.textContent = formatExpiry(acc.expiry_date);
 
       const actTd = document.createElement("td");
+      actTd.style.display = "flex";
+      actTd.style.flexDirection = "row";
+      actTd.style.gap = "6px";
 
-      const quotaBtn = document.createElement("button");
-      quotaBtn.className = "btn small";
-      quotaBtn.style.marginRight = "6px";
-      quotaBtn.textContent = "额度";
-      quotaBtn.addEventListener("click", async () => {
-        els.quotaModal.classList.add("open");
-        els.quotaBody.innerHTML = '<div class="loading-spinner">加载中...</div>';
-        try {
-          const res = await apiFetch(`/admin/api/accounts/${encodeURIComponent(acc.file)}/quota`, { method: "GET" });
-          renderQuotaTable(res.data);
-        } catch (e) {
-          els.quotaBody.innerHTML = `<div style="color: #ff6b6b; padding: 20px;">加载失败：${e.message || e}</div>`;
-        }
-      });
-      actTd.appendChild(quotaBtn);
-
+      // 删除按钮
       const delBtn = document.createElement("button");
       delBtn.className = "btn small danger";
       delBtn.textContent = "删除";
@@ -195,13 +443,24 @@
       });
       actTd.appendChild(delBtn);
 
+      // 刷新额度按钮（放在删除按钮下方）
+      const refreshBtn = document.createElement("button");
+      refreshBtn.className = "btn small";
+      refreshBtn.textContent = "刷新";
+      refreshBtn.addEventListener("click", () => refreshSingleQuota(acc.file, refreshBtn, quotaTd));
+      actTd.appendChild(refreshBtn);
+
       tr.appendChild(fileTd);
       tr.appendChild(emailTd);
       tr.appendChild(pidTd);
+      tr.appendChild(quotaTd);
       tr.appendChild(expTd);
       tr.appendChild(actTd);
       els.accountsBody.appendChild(tr);
     }
+
+    // 账号渲染完成后，自动填充已缓存的额度数据
+    updateQuotaCellsFromCache();
   }
 
   async function refreshAccounts() {
@@ -404,6 +663,19 @@
     els.quotaModal.addEventListener("click", (e) => {
       if (e.target === els.quotaModal) closeQuotaModal();
     });
+    // 一键刷新额度按钮
+    if (els.btnRefreshAllQuotas) {
+      els.btnRefreshAllQuotas.addEventListener("click", refreshAllQuotas);
+    }
+    // 排序按钮
+    const sortClaudeBtn = document.getElementById("sortClaude");
+    const sortGeminiBtn = document.getElementById("sortGemini");
+    if (sortClaudeBtn) {
+      sortClaudeBtn.addEventListener("click", () => toggleSort("claude"));
+    }
+    if (sortGeminiBtn) {
+      sortGeminiBtn.addEventListener("click", () => toggleSort("gemini"));
+    }
   }
 
   function normalizeVersion(value) {
@@ -497,6 +769,9 @@
 
   loadApiKey();
   bindEvents();
-  reloadAccountsAndRender();
+  reloadAccountsAndRender().then(() => {
+    // 账号加载完成后自动获取额度信息
+    fetchAllQuotas();
+  });
   refreshVersionInfo();
 })();

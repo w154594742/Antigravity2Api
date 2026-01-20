@@ -259,7 +259,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Admin API (API key protected inside handler)
-    const adminResp = await handleAdminRoute(req, parsedUrl, { authManager, upstreamClient, config, logger });
+    const adminResp = await handleAdminRoute(req, parsedUrl, { authManager, upstreamClient, quotaRefresher: upstreamClient.quotaRefresher, config, logger });
     if (adminResp) {
       logger.logResponse(adminResp.status || 200, {
         requestId,

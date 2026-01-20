@@ -9,7 +9,7 @@ function isApiKeyValid(apiKey, config) {
   return config.api_keys.includes(apiKey);
 }
 
-async function handleAdminRoute(req, parsedUrl, { authManager, upstreamClient, config, logger } = {}) {
+async function handleAdminRoute(req, parsedUrl, { authManager, upstreamClient, quotaRefresher, config, logger } = {}) {
   if (!parsedUrl.pathname.startsWith("/admin/api/")) return null;
 
   const apiKey = extractApiKey(req.headers);
@@ -34,6 +34,28 @@ async function handleAdminRoute(req, parsedUrl, { authManager, upstreamClient, c
     if (quotaMatch && req.method === "GET") {
       const fileName = decodeURIComponent(quotaMatch[1] || "");
       const data = await accounts.getAccountQuota(authManager, fileName, upstreamClient);
+      return jsonResponse(200, { success: true, data });
+    }
+
+    // 获取所有账号额度（用于列表内联显示）
+    if (parsedUrl.pathname === "/admin/api/accounts/quotas" && req.method === "GET") {
+      const data = await accounts.getAllAccountsQuota(authManager, upstreamClient);
+      return jsonResponse(200, { success: true, data });
+    }
+
+    // 一键刷新所有账号额度
+    if (parsedUrl.pathname === "/admin/api/accounts/quotas/refresh" && req.method === "POST") {
+      const refreshResult = await accounts.refreshAllQuotas(quotaRefresher);
+      // 刷新后重新获取所有额度
+      const data = await accounts.getAllAccountsQuota(authManager, upstreamClient);
+      return jsonResponse(200, { success: true, data, refreshResult });
+    }
+
+    // 刷新单个账号额度
+    const refreshQuotaMatch = parsedUrl.pathname.match(/^\/admin\/api\/accounts\/(.+)\/quota\/refresh$/);
+    if (refreshQuotaMatch && req.method === "POST") {
+      const fileName = decodeURIComponent(refreshQuotaMatch[1] || "");
+      const data = await accounts.refreshSingleQuota(authManager, fileName, upstreamClient);
       return jsonResponse(200, { success: true, data });
     }
 
