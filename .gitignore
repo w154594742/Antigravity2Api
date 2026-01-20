@@ -1,5 +1,6 @@
 .env
-.claude
+.claude/*
+!.claude/commands/
 .serena
 auths/
 log/
