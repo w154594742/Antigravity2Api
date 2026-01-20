@@ -36,23 +36,25 @@ try {
  * Claude 模型名映射到 Gemini 模型名
  */
 function mapClaudeModelToGemini(claudeModel) {
-  const supportedModels = ["claude-opus-4-5-thinking", "claude-sonnet-4-5", "claude-sonnet-4-5-thinking"];
+  const supportedModels = [
+    "claude-opus-4-5-thinking",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-5-thinking",
+    "gemini-3-pro-high",
+    "gemini-3-pro-low",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gpt-oss-120b-medium",
+  ];
   if (supportedModels.includes(claudeModel)) return claudeModel;
 
   const mapping = {
     "claude-sonnet-4-5-20250929": "claude-sonnet-4-5-thinking",
-    "claude-3-5-sonnet-20241022": "claude-sonnet-4-5",
-    "claude-3-5-sonnet-20240620": "claude-sonnet-4-5",
-    "claude-opus-4": "claude-opus-4-5-thinking",
     "claude-opus-4-5-20251101": "claude-opus-4-5-thinking",
     "claude-opus-4-5": "claude-opus-4-5-thinking",
-    "claude-haiku-4": "claude-sonnet-4-5",
-    "claude-3-haiku-20240307": "claude-sonnet-4-5",
-    "claude-haiku-4-5-20251001": "claude-sonnet-4-5",
-    "gemini-2.5-flash": "gemini-2.5-flash",
-    "gemini-3-flash": "gemini-3-flash",
   };
-  return mapping[claudeModel] || "claude-sonnet-4-5";
+  return mapping[claudeModel];
 }
 
 /**
@@ -283,7 +285,24 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
               if (item.id && item.name) {
                 toolIdToName.set(item.id, item.name);
               }
-              clientContent.parts.push({ text: buildMcpToolCallXml(item.name, item.input || {}) });
+
+              // 下游如果已经回传了该 tool_use 的签名（tool_use.signature 或紧邻 thinking.signature），
+              // 则可以清理本地缓存，避免 tool_thought_signatures.json 长期膨胀。
+              const pendingSig = shouldForwardThoughtSignatures ? pendingThoughtSignature : null;
+              const itemSig = typeof item.signature === "string" && item.signature ? item.signature : null;
+              if (item.id && (itemSig || pendingSig)) {
+                deleteToolThoughtSignature(item.id);
+              }
+              // 消费 pending：无论是否使用（例如 tool_use 已自带签名），都认为已到达“thinking 之后的第一个输出 part”。
+              if (pendingSig) pendingThoughtSignature = null;
+
+              const part = { text: buildMcpToolCallXml(item.name, item.input || {}) };
+              if (itemSig && shouldForwardThoughtSignatures) {
+                part.thoughtSignature = itemSig;
+              } else if (pendingSig && shouldForwardThoughtSignatures) {
+                part.thoughtSignature = pendingSig;
+              }
+              clientContent.parts.push(part);
               sawNonThinkingContent = true;
               previousWasToolResult = false;
               continue;
