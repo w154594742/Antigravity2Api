@@ -9,6 +9,7 @@ const {
   buildMcpToolCallXml,
   buildMcpToolResultXml,
 } = require("../../mcp/mcpXmlBridge");
+const { mapClaudeModelFromEnv } = require("../modelMap");
 const { getToolThoughtSignature, deleteToolThoughtSignature, isDebugEnabled } = require("./ToolThoughtSignatureStore");
 const { cleanJsonSchema, extractInlineDataPartsFromClaudeToolResultContent } = require("./ClaudeRequestUtils");
 
@@ -36,6 +37,12 @@ try {
  * Claude 模型名映射到 Gemini 模型名
  */
 function mapClaudeModelToGemini(claudeModel) {
+  const model = String(claudeModel || "").trim();
+  if (!model) return undefined;
+
+  const envMapped = mapClaudeModelFromEnv(model);
+  if (envMapped) return envMapped;
+
   const supportedModels = [
     "claude-opus-4-5-thinking",
     "claude-sonnet-4-5",
@@ -47,14 +54,14 @@ function mapClaudeModelToGemini(claudeModel) {
     "gemini-2.5-flash-lite",
     "gpt-oss-120b-medium",
   ];
-  if (supportedModels.includes(claudeModel)) return claudeModel;
+  if (supportedModels.includes(model)) return model;
 
   const mapping = {
     "claude-sonnet-4-5-20250929": "claude-sonnet-4-5-thinking",
     "claude-opus-4-5-20251101": "claude-opus-4-5-thinking",
     "claude-opus-4-5": "claude-opus-4-5-thinking",
   };
-  return mapping[claudeModel];
+  return mapping[model];
 }
 
 /**

@@ -98,6 +98,8 @@ AG2API_DEBUG=false
 AG2API_LOG_RETENTION_DAYS=3
 AG2API_RETRY_DELAY_MS=1200
 AG2API_QUOTA_REFRESH_S=300
+AG2API_CLAUDE_MODEL_MAP={"claude-haiku-4-5":"gemini-3-flash","claude-haiku-4-5-20251001":"gemini-3-flash"}
+AG2API_GEMINI_MODEL_MAP={"gemini-3-flash-preview":"gemini-3-flash"}
 AG2API_MCP_XML_ENABLED=true
 # Deprecated:
 # AG2API_SWITCH_TO_MCP_MODEL=gemini-3-flash
@@ -115,6 +117,8 @@ AG2API_UPDATE_REPO=znlsl/Antigravity2Api
 - `AG2API_LOG_RETENTION_DAYS`：日志保留天数（默认 3；设为 0 表示不自动清理；当 >0 且服务长时间不重启时，会按该天数轮转日志文件，并在轮转后清理旧日志文件，避免单个日志无限增长）
 - `AG2API_RETRY_DELAY_MS`：网络错误 / 429 重试前的固定等待（毫秒，默认 1200）
 - `AG2API_QUOTA_REFRESH_S`：额度刷新间隔（秒；每次并发刷新所有账号；默认 300）
+- `AG2API_CLAUDE_MODEL_MAP`：Claude 模型映射（Claude API 入站 model -> 上游 model），仅支持 JSON 对象字符串（支持多个映射）
+- `AG2API_GEMINI_MODEL_MAP`：Gemini 模型映射（Gemini API 入站 model -> 上游 model），仅支持 JSON 对象字符串（支持多个映射）
 - `AG2API_MCP_XML_ENABLED`：MCP XML 方案开关（仅 `mcp__*`）；开启后不透传 `mcp__* tools` 给 v1internal，改为 XML 协议桥接并在下游还原为 `tool_use/tool_result`
 - `AG2API_SWITCH_TO_MCP_MODEL`：（已弃用）旧的 MCP Switch 方案；为空/不配置表示关闭，配置为 `gemini-*`（如 `gemini-3-flash`）表示在检测到 `AG2API_SWITCH_TO_MCP_MODEL` 信号或 `mcp__* tool_use` 时自动切换并重试
 - `AG2API_UPDATE_REPO`：管理界面版本检查的 GitHub 仓库（默认 `znlsl/Antigravity2Api`，用于获取 latest release）
@@ -248,9 +252,9 @@ docker compose -f docker-compose.ghcr.yml up -d
 docker compose up -d --build
 ```
 
-## 7. 客户端连接 (如 CherryStudio)
+## 7. 客户端连接
 
-在客户端中添加自定义提供商（Claude）：
+在客户端中添加自定义提供商：
 
 *   **API 地址 (Endpoint)**: `http://localhost:3000` (或 `http://<本机IP>:3000`)
     *   Claude 兼容路径: `http://localhost:3000/v1/messages`
@@ -290,7 +294,7 @@ docker compose up -d --build
               "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             }
             ```
-    *   **Gemini API** 支持如下模型（可在 Gemini CLI 中使用 Claude 模型）:
+    *   **Gemini API** 支持如下模型（可在 Gemini API 中使用 Claude 模型）:
         *   `claude-sonnet-4-5`
         *   `claude-sonnet-4-5-thinking`
         *   `claude-opus-4-5-thinking`
@@ -301,10 +305,6 @@ docker compose up -d --build
         *   `gemini-2.5-flash`
         *   `gemini-2.5-flash-lite`
         *   `gpt-oss-120b-medium（仅限于chat）`
-        *   使用 Claude 的参考启动命令:
-            ```bash
-            gemini --model claude-opus-4-5-thinking
-            ```
 
 *   **OAuth 回调打不开**:
     *   授权完成后若跳到 `http://localhost:<port>/oauth-callback`，请把 `localhost:<port>` 改成当前服务地址再访问。
