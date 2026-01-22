@@ -69,6 +69,17 @@ function cleanSchema(schema) {
     }
     if (removeKeys.has(k)) continue;
 
+    // `properties` is a map of propertyName -> schema. Preserve property names (e.g. a parameter named "format")
+    // and only clean each property's schema value.
+    if (k === "properties" && v && typeof v === "object" && !Array.isArray(v)) {
+      const cleanedProperties = {};
+      for (const [propName, propSchema] of Object.entries(v)) {
+        cleanedProperties[propName] = typeof propSchema === "object" && propSchema !== null ? cleanSchema(propSchema) : propSchema;
+      }
+      result.properties = cleanedProperties;
+      continue;
+    }
+
     if (k === "type" && Array.isArray(v)) {
       const filtered = v.filter((x) => x !== "null");
       result.type = filtered[0] || v[0] || "string";

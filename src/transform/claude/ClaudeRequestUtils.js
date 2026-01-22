@@ -47,7 +47,6 @@ function cleanJsonSchema(schema) {
   const removeKeys = new Set([
     "$schema",
     "additionalProperties",
-    "format",
     "default",
     "uniqueItems",
     // v1internal Schema doesn't support JSON Schema draft keywords like `propertyNames`.
@@ -73,6 +72,18 @@ function cleanJsonSchema(schema) {
     }
 
     if (removeKeys.has(key) || key in validationFields) continue;
+
+    // `properties` is a map of propertyName -> schema. Preserve property names (e.g. a parameter named "format")
+    // and only clean each property's schema value.
+    if (key === "properties" && value && typeof value === "object" && !Array.isArray(value)) {
+      const cleanedProperties = {};
+      for (const [propName, propSchema] of Object.entries(value)) {
+        cleanedProperties[propName] =
+          typeof propSchema === "object" && propSchema !== null ? cleanJsonSchema(propSchema) : propSchema;
+      }
+      cleaned.properties = cleanedProperties;
+      continue;
+    }
 
     // Normalize union types like ["string","null"] to a single type (prefer non-null)
     if (key === "type" && Array.isArray(value)) {
@@ -175,4 +186,3 @@ module.exports = {
   cleanJsonSchema,
   extractInlineDataPartsFromClaudeToolResultContent,
 };
-
