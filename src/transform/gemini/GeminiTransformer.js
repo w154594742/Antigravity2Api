@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { mapGeminiModelFromEnv } = require("../modelMap");
 
 function normalizeAntigravitySystemInstructionText(text) {
   if (typeof text !== "string") return "";
@@ -45,7 +46,6 @@ function cleanSchema(schema) {
   const removeKeys = new Set([
     "$schema",
     "additionalProperties",
-    "format",
     "default",
     "uniqueItems",
     // v1internal Schema doesn't support JSON Schema draft keywords like `propertyNames`.
@@ -176,12 +176,12 @@ function wrapRequest(clientJson, options) {
   }
 
   // Map preview model name based on thinking level (high/low)
-  let mappedModelName = modelName;
+  let mappedModelName = mapGeminiModelFromEnv(modelName) || modelName;
   const levelForMapping = innerRequest?.generationConfig?.thinkingConfig?.thinkingLevel;
-  if (modelName === "gemini-3-flash-preview") {
+  if (mappedModelName === "gemini-3-flash-preview") {
     mappedModelName = "gemini-3-flash";
   }
-  if (modelName === "gemini-3-pro-preview" && typeof levelForMapping === "string") {
+  if (mappedModelName === "gemini-3-pro-preview" && typeof levelForMapping === "string") {
     const lvl = levelForMapping.toLowerCase();
     if (lvl === "high") mappedModelName = "gemini-3-pro-high";
     else if (lvl === "low") mappedModelName = "gemini-3-pro-low";
