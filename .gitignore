@@ -1,6 +1,7 @@
 .env
 .claude/*
 !.claude/commands/
+!.claude/LOCAL_CHANGES.md
 .serena
 auths/
 log/

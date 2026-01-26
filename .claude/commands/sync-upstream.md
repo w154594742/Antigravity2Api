@@ -77,6 +77,33 @@ git push origin main
 
 ---
 
+### 阶段 3.5：本地特性检查（重要）
+
+#### 3.5.1 读取本地改动清单
+```bash
+cat .claude/LOCAL_CHANGES.md
+```
+查阅本地特性改动文档，了解 dev 分支的关键改动。
+
+#### 3.5.2 检查高风险文件
+对比上游是否修改了本地改动涉及的关键文件：
+```bash
+git diff main..upstream/main -- src/transform/claude/ClaudeRequestIn.js
+git diff main..upstream/main -- src/transform/gemini/GeminiTransformer.js
+git diff main..upstream/main -- src/api/claudeApi.js
+git diff main..upstream/main -- src/ui/app.js
+```
+
+#### 3.5.3 风险评估
+根据检查结果向用户报告：
+- 🔴 **高风险**：上游修改了本地改动的同一文件/位置，合并时很可能冲突
+- 🟡 **中风险**：上游修改了相关文件，需关注合并结果
+- 🟢 **低风险**：上游未修改本地改动文件，可安全合并
+
+**请求用户确认是否继续合并**。
+
+---
+
 ### 阶段四：合并到开发分支
 
 #### 4.1 切换并合并
@@ -89,10 +116,11 @@ git merge main
 #### 4.2 冲突处理（如有）
 如果合并时出现冲突：
 1. 列出所有冲突文件
-2. 逐个分析冲突内容和上下文
-3. 说明冲突原因（上游改了什么 vs 本地改了什么）
-4. 给出解决建议
-5. **等待用户决策**后再执行解决
+2. **对照 `.claude/LOCAL_CHANGES.md` 中的合并策略**
+3. 逐个分析冲突内容和上下文
+4. 说明冲突原因（上游改了什么 vs 本地改了什么）
+5. 根据文档中的"冲突解决原则"给出建议
+6. **等待用户决策**后再执行解决
 
 ---
 
@@ -163,8 +191,9 @@ git push origin <dev_branch>                          # 再次推送
 |--------|------|------|
 | ① | 差异分析后 | 确认是否继续同步 |
 | ② | 工作区有更改时 | 确认 stash 方式（自动/手动/取消） |
-| ③ | 合并冲突时 | 用户决定解决策略 |
-| ④ | Review 完成后 | 确认是否 push |
+| ③ | 本地特性检查后 | 确认高风险文件的合并风险 |
+| ④ | 合并冲突时 | 用户决定解决策略（参考 LOCAL_CHANGES.md） |
+| ⑤ | Review 完成后 | 确认是否 push |
 
 ## 注意事项
 
