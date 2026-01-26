@@ -3,9 +3,9 @@ const fs = require("fs");
 const path = require("path");
 const { mapGeminiModelFromEnv } = require("../modelMap");
 
+// 加载 Antigravity 系统指令（上游 API 需要此指令避免 429 错误）
 function normalizeAntigravitySystemInstructionText(text) {
   if (typeof text !== "string") return "";
-  // Allow the file to be pasted from JSON logs (single line with literal "\n"/"\t" escapes).
   if (!text.includes("\n") && text.includes("\\n")) {
     return text
       .replace(/\\r\\n/g, "\n")
@@ -23,9 +23,7 @@ try {
     path.resolve(__dirname, "../claude/antigravity_system_instruction.txt"),
     "utf8"
   );
-  antigravitySystemInstructionText = normalizeAntigravitySystemInstructionText(
-    antigravitySystemInstructionText
-  );
+  antigravitySystemInstructionText = normalizeAntigravitySystemInstructionText(antigravitySystemInstructionText);
 } catch (_) {}
 
 // Convert parametersJsonSchema -> parameters (clean + uppercase type names) for v1internal
@@ -258,18 +256,28 @@ function wrapRequest(clientJson, options) {
     mappedModelName = "gemini-2.5-flash";
   }
 
-  // Some upstream models (e.g. claude-*, gemini-3-pro*) require an Antigravity-style systemInstruction,
-  // otherwise they may respond with 429 RESOURCE_EXHAUSTED even when quota exists.
+  // 上游 API 需要 Antigravity 风格的 systemInstruction，否则可能返回 429 RESOURCE_EXHAUSTED
+  // 修改策略：追加而非替换，保留原有系统提示词
   const modelNameForSystem = String(mappedModelName || "").toLowerCase();
   if (
-    (modelNameForSystem.includes("claude") || modelNameForSystem.includes("gemini-3-pro")) &&
+    (modelNameForSystem.includes("claude") || modelNameForSystem.includes("gemini")) &&
     antigravitySystemInstructionText
   ) {
-    // Directly replace the entire systemInstruction with antigravity content
-    innerRequest.systemInstruction = {
-      role: "user",
-      parts: [{ text: antigravitySystemInstructionText }],
-    };
+    // 构建追加指令：Antigravity 系统指令 + 中文响应指令
+    const languageInstruction = "Always respond in Chinese-simplified unless the user explicitly requests another language.";
+    const appendInstructions = antigravitySystemInstructionText + "\n\n" + languageInstruction;
+
+    if (innerRequest.systemInstruction && Array.isArray(innerRequest.systemInstruction.parts)) {
+      innerRequest.systemInstruction.parts.push({ text: appendInstructions });
+    } else if (innerRequest.systemInstruction && typeof innerRequest.systemInstruction === "object") {
+      innerRequest.systemInstruction.parts = [{ text: appendInstructions }];
+      innerRequest.systemInstruction.role = "user";
+    } else {
+      innerRequest.systemInstruction = {
+        role: "user",
+        parts: [{ text: appendInstructions }],
+      };
+    }
   }
 
   const wrappedBody = {

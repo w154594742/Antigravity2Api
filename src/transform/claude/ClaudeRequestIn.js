@@ -12,10 +12,11 @@ const {
 const { mapClaudeModelFromEnv } = require("../modelMap");
 const { getToolThoughtSignature, deleteToolThoughtSignature, isDebugEnabled } = require("./ToolThoughtSignatureStore");
 const { cleanJsonSchema, extractInlineDataPartsFromClaudeToolResultContent } = require("./ClaudeRequestUtils");
+const { normalizeThoughtSignature } = require("./ThoughtSignatureUtils"); // [LOCAL-FIX] 签名前缀剥离
 
+// 加载 Antigravity 系统指令（上游 API 需要此指令避免 429 错误）
 function normalizeAntigravitySystemInstructionText(text) {
   if (typeof text !== "string") return "";
-  // Allow the file to be pasted from JSON logs (single line with literal "\n"/"\t" escapes).
   if (!text.includes("\n") && text.includes("\\n")) {
     return text
       .replace(/\\r\\n/g, "\n")
@@ -133,27 +134,22 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
     }
   }
 
-  // Some upstream models (e.g. claude-*, gemini-3-pro*) require an Antigravity-style systemInstruction,
-  // otherwise they may respond with 429 RESOURCE_EXHAUSTED even when quota exists.
+  // 上游 API 需要 Antigravity 风格的 systemInstruction，否则可能返回 429 RESOURCE_EXHAUSTED
+  // 修改策略：追加而非替换，保留原有系统提示词（解决身份暴露问题）
   const modelNameForSystem = String(claudeReq?.model || "").toLowerCase();
   if ((modelNameForSystem.includes("claude") || modelNameForSystem.includes("gemini")) && antigravitySystemInstructionText) {
+    // 构建追加指令：Antigravity 系统指令 + 中文响应指令
+    const languageInstruction = "Always respond in Chinese-simplified unless the user explicitly requests another language.";
+    const appendInstructions = antigravitySystemInstructionText + "\n\n" + languageInstruction;
+
     if (systemInstruction && Array.isArray(systemInstruction.parts)) {
-      let replaced = false;
-      for (const part of systemInstruction.parts) {
-        if (typeof part?.text === "string" && part.text.includes("You are Claude Code")) {
-          part.text = antigravitySystemInstructionText;
-          replaced = true;
-        }
-      }
-      // If no Claude Code marker was found, prepend an Antigravity-style instruction.
-      if (!replaced) {
-        systemInstruction.parts.unshift({ text: antigravitySystemInstructionText });
-      }
+      // 追加到末尾，保留原有系统提示词
+      systemInstruction.parts.push({ text: appendInstructions });
       systemInstruction.role = "user";
     } else {
       systemInstruction = {
         role: "user",
-        parts: [{ text: antigravitySystemInstructionText }],
+        parts: [{ text: appendInstructions }],
       };
     }
   }
@@ -237,7 +233,8 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
             // 重要：我们在 response 侧会用一个空的 Claude "thinking" block 来承载“空 text part 的 thoughtSignature”（Claude text 不支持 signature）。
             // 这个 block 本质上是“空 text + signature”，不应当在 v1internal 中还原成 thought=true（否则会上游被当作 thinking block 校验，可能触发 400）。
             const thinkingText = typeof item.thinking === "string" ? item.thinking : "";
-            const signature = typeof item.signature === "string" ? item.signature : "";
+            // [LOCAL-FIX] 去除 claude# 前缀，原代码: typeof item.signature === "string" ? item.signature : ""
+            const signature = normalizeThoughtSignature(item.signature);
 
             // 避免请求侧发送空字符串字段（部分上游会直接 400）
             if (thinkingText.length === 0) {
@@ -300,14 +297,14 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
               if (item.id && (itemSig || pendingSig)) {
                 deleteToolThoughtSignature(item.id);
               }
-              // 消费 pending：无论是否使用（例如 tool_use 已自带签名），都认为已到达“thinking 之后的第一个输出 part”。
+              // 消费 pending：无论是否使用（例如 tool_use 已自带签名），都认为已到达"thinking 之后的第一个输出 part"。
               if (pendingSig) pendingThoughtSignature = null;
 
+              // 当找不到有效签名时，使用 sentinel 值绕过验证
+              const SKIP_SIGNATURE_SENTINEL = "skip_thought_signature_validator";
               const part = { text: buildMcpToolCallXml(item.name, item.input || {}) };
-              if (itemSig && shouldForwardThoughtSignatures) {
-                part.thoughtSignature = itemSig;
-              } else if (pendingSig && shouldForwardThoughtSignatures) {
-                part.thoughtSignature = pendingSig;
+              if (shouldForwardThoughtSignatures) {
+                part.thoughtSignature = itemSig || pendingSig || SKIP_SIGNATURE_SENTINEL;
               }
               clientContent.parts.push(part);
               sawNonThinkingContent = true;
@@ -331,11 +328,12 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
             }
             const pendingSig = shouldForwardThoughtSignatures ? pendingThoughtSignature : null;
 
-            // 优先使用“下游回传”的签名（tool_use.signature 或紧邻的 thinking.signature），保证严格按收到的值回放。
+            // 优先使用"下游回传"的签名（tool_use.signature 或紧邻的 thinking.signature），保证严格按收到的值回放。
             // 只有当下游没有回传时，才从本地缓存补回（Claude Code 通常不会回传 tool_use.signature）。
             let sig = null;
             if (typeof item.signature === "string" && item.signature) {
-              sig = item.signature;
+              // [LOCAL-FIX] 去除 claude# 前缀，原代码: sig = item.signature
+              sig = normalizeThoughtSignature(item.signature);
             } else if (pendingSig) {
               sig = pendingSig;
               // 下游已经回传了该 tool_use 的签名（以 thinking.signature 的形式），本地缓存不再需要，立即清理。
@@ -344,11 +342,15 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
               sig = getToolThoughtSignature(item.id);
             }
 
-            // 消费 pending：无论是否使用（例如 tool_use 已自带签名），都认为已到达“thinking 之后的第一个输出 part”。
+            // 消费 pending：无论是否使用（例如 tool_use 已自带签名），都认为已到达"thinking 之后的第一个输出 part"。
             if (pendingSig) pendingThoughtSignature = null;
-            if (sig && shouldForwardThoughtSignatures && !fcPart.thoughtSignature) {
-              fcPart.thoughtSignature = sig;
-              if (!item.signature && isDebugEnabled() && item.id && sig !== pendingSig) {
+
+            // 当找不到有效签名时，使用 sentinel 值绕过验证（参考 CLIProxyAPI 实现）
+            // 上游 API 要求 functionCall 必须携带 thoughtSignature，否则返回 400 INVALID_ARGUMENT
+            const SKIP_SIGNATURE_SENTINEL = "skip_thought_signature_validator";
+            if (shouldForwardThoughtSignatures && !fcPart.thoughtSignature) {
+              fcPart.thoughtSignature = sig || SKIP_SIGNATURE_SENTINEL;
+              if (!item.signature && isDebugEnabled() && item.id && sig && sig !== pendingSig) {
                 console.log(`[ThoughtSignature] injected tool_use.id=${item.id}`);
               }
             }
