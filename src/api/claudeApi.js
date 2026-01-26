@@ -11,6 +11,30 @@ function hasWebSearchTool(claudeReq) {
   return Array.isArray(claudeReq?.tools) && claudeReq.tools.some((tool) => tool?.name === "web_search");
 }
 
+/**
+ * [LOCAL-FIX] 检测历史消息中是否存在 thoughtSignature
+ * 用于跨模型切换时判断是否需要禁用签名转发
+ * @param {Array} messages - Claude 格式的消息数组
+ * @returns {boolean} 是否存在签名
+ */
+function hasThoughtSignatureInHistory(messages) {
+  if (!Array.isArray(messages)) return false;
+  for (const msg of messages) {
+    if (!Array.isArray(msg?.content)) continue;
+    for (const item of msg.content) {
+      // 检查 thinking block 的 signature
+      if (item?.type === "thinking" && typeof item.signature === "string" && item.signature) {
+        return true;
+      }
+      // 检查 tool_use 的 signature
+      if (item?.type === "tool_use" && typeof item.signature === "string" && item.signature) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function inferFinalModelForQuota(claudeReq) {
   if (hasWebSearchTool(claudeReq)) return "gemini-2.5-flash";
   return mapClaudeModelToGemini(claudeReq?.model);
@@ -206,6 +230,22 @@ class ClaudeApi {
             mcpModel,
             inferFinalModelForQuota,
           }));
+      } else {
+        // [LOCAL-FIX] 非 MCP 场景下的跨模型签名隔离
+        // 跨模型切换时禁用签名转发，避免签名不兼容导致 400 错误
+        const targetFamily = String(mapClaudeModelToGemini(requestData.model) || "").toLowerCase();
+        const isTargetGemini = targetFamily.startsWith("gemini") || targetFamily.includes("gpt-oss");
+        const isTargetClaude = targetFamily.startsWith("claude");
+        const hasHistoryWithSignature = hasThoughtSignatureInHistory(requestData.messages);
+
+        // 场景1: Claude → Gemini（原有逻辑）
+        // 场景2: Gemini → Claude（新增：历史消息包含签名时禁用转发）
+        if (
+          (isTargetGemini && Array.isArray(requestData.messages) && requestData.messages.length > 0) ||
+          (isTargetClaude && hasHistoryWithSignature)
+        ) {
+          transformOptions = { forwardThoughtSignatures: false };
+        }
       }
 
       const forceStreamForNonStreaming =
