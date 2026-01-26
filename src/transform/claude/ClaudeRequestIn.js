@@ -300,12 +300,12 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
               // 消费 pending：无论是否使用（例如 tool_use 已自带签名），都认为已到达"thinking 之后的第一个输出 part"。
               if (pendingSig) pendingThoughtSignature = null;
 
-              // 当找不到有效签名时，使用 sentinel 值绕过验证
+              // 上游 API 要求所有 text part（MCP XML）必须携带 thoughtSignature
+              // - forwardThoughtSignatures=true: 使用真实签名，找不到时用 sentinel
+              // - forwardThoughtSignatures=false: 直接使用 sentinel（如 Gemini 目标模型）
               const SKIP_SIGNATURE_SENTINEL = "skip_thought_signature_validator";
               const part = { text: buildMcpToolCallXml(item.name, item.input || {}) };
-              if (shouldForwardThoughtSignatures) {
-                part.thoughtSignature = itemSig || pendingSig || SKIP_SIGNATURE_SENTINEL;
-              }
+              part.thoughtSignature = shouldForwardThoughtSignatures ? (itemSig || pendingSig || SKIP_SIGNATURE_SENTINEL) : SKIP_SIGNATURE_SENTINEL;
               clientContent.parts.push(part);
               sawNonThinkingContent = true;
               previousWasToolResult = false;
@@ -345,12 +345,13 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
             // 消费 pending：无论是否使用（例如 tool_use 已自带签名），都认为已到达"thinking 之后的第一个输出 part"。
             if (pendingSig) pendingThoughtSignature = null;
 
-            // 当找不到有效签名时，使用 sentinel 值绕过验证（参考 CLIProxyAPI 实现）
-            // 上游 API 要求 functionCall 必须携带 thoughtSignature，否则返回 400 INVALID_ARGUMENT
+            // 上游 API 要求所有 functionCall 必须携带 thoughtSignature，否则返回 400 INVALID_ARGUMENT
+            // - forwardThoughtSignatures=true: 使用真实签名，找不到时用 sentinel
+            // - forwardThoughtSignatures=false: 直接使用 sentinel（如 Gemini 目标模型）
             const SKIP_SIGNATURE_SENTINEL = "skip_thought_signature_validator";
-            if (shouldForwardThoughtSignatures && !fcPart.thoughtSignature) {
-              fcPart.thoughtSignature = sig || SKIP_SIGNATURE_SENTINEL;
-              if (!item.signature && isDebugEnabled() && item.id && sig && sig !== pendingSig) {
+            if (!fcPart.thoughtSignature) {
+              fcPart.thoughtSignature = shouldForwardThoughtSignatures ? (sig || SKIP_SIGNATURE_SENTINEL) : SKIP_SIGNATURE_SENTINEL;
+              if (shouldForwardThoughtSignatures && !item.signature && isDebugEnabled() && item.id && sig && sig !== pendingSig) {
                 console.log(`[ThoughtSignature] injected tool_use.id=${item.id}`);
               }
             }
